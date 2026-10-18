@@ -1,0 +1,13 @@
+# Opsional — hanya kalau mau Postgres via Docker. Kalau Postgres sudah
+# terinstal langsung di Mac, file ini tidak dipakai (lihat README).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trytuist
+      POSTGRES_PASSWORD: trytuist
+      POSTGRES_DB: trytuist
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+volumes:
+  pgdata:

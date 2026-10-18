@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS order_ratings;
+DROP TABLE IF EXISTS order_status_history;
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS orders;
+DROP TYPE IF EXISTS order_status;
+DROP TABLE IF EXISTS user_vouchers;
+DROP TABLE IF EXISTS vouchers;
+DROP TABLE IF EXISTS favorites;
+DROP TABLE IF EXISTS addresses;
+DROP TABLE IF EXISTS stores;
+DROP TABLE IF EXISTS banners;
+DROP TABLE IF EXISTS product_options;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS categories;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS users;
