@@ -57,6 +57,7 @@ type Voucher struct {
 // Quote adalah hasil perhitungan harga di server.
 type Quote struct {
 	StoreID     string
+	StoreName   string
 	AddressID   *string
 	Lines       []Line
 	Subtotal    int64

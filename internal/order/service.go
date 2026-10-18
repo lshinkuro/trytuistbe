@@ -2,6 +2,7 @@ package order
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -15,12 +16,20 @@ import (
 	"trytuist-api/internal/catalog"
 	"trytuist-api/internal/database"
 	"trytuist-api/internal/httpx"
+	"trytuist-api/internal/push"
 	"trytuist-api/internal/user"
 )
 
 type Config struct {
 	AppConfig *appconfig.Repository // sumber order_rules & payment_methods
 	Location  *time.Location        // untuk tanggal di nomor order
+	// OnlinePayments: Midtrans aktif (§5.27). Metode online (ONLINE/QRIS/e-wallet) wajib lewat
+	// POST /v1/checkout; POST /v1/orders hanya untuk COD.
+	OnlinePayments bool
+	// CODDisabled: COD_ENABLED=false → "Bayar di Tempat" ditolak.
+	CODDisabled bool
+	// Notifier: push ke pelanggan saat status pesanan diubah outlet / admin (§5.28). nil = nonaktif.
+	Notifier push.Notifier
 }
 
 type Service struct {
@@ -56,7 +65,7 @@ type CreateInput struct {
 
 // PaymentChoice: metode pembayaran yang dipakai pesanan + snapshot akun e-wallet.
 type PaymentChoice struct {
-	Method        string // COD | QRIS | EWALLET
+	Method        string // COD | QRIS | EWALLET | ONLINE
 	AccountID     *string
 	Provider      *string
 	AccountMasked *string
@@ -90,7 +99,7 @@ func (s *Service) resolvePayment(ctx context.Context, db database.DBTX, userID, 
 		return httpx.Validation("Data yang dikirim tidak valid.", httpx.FieldDetail{
 			Field: "payment_method", Message: "tidak sesuai dengan payment_method_id (" + want + ")"})
 	}
-	if up := strings.ToUpper(id); up == "COD" || up == "QRIS" {
+	if up := strings.ToUpper(id); up == "COD" || up == "QRIS" || up == "ONLINE" {
 		if method != "" && method != up {
 			return PaymentChoice{}, mismatch(up)
 		}
@@ -129,11 +138,58 @@ func (s *Service) Quote(ctx context.Context, userID string, in QuoteInput) (Quot
 }
 
 func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in QuoteInput) (Quote, error) {
+	if len(in.Items) == 0 {
+		return Quote{}, httpx.Unprocessable("EMPTY_CART", "Keranjang masih kosong.")
+	}
+	q := Quote{}
+	cat := catalog.NewRepository(db)
+
+	// Alamat (opsional): koordinatnya dipakai untuk memilih outlet & cek jangkauan antar.
+	var coord *catalog.Coord
+	if a := strings.TrimSpace(in.AddressID); a != "" {
+		if !uuidRe.MatchString(a) {
+			return Quote{}, httpx.NotFound("Alamat pengiriman tidak ditemukan.")
+		}
+		ok, lat, lng, err := s.repo.AddressCoord(ctx, db, a, userID)
+		if err != nil {
+			return Quote{}, err
+		}
+		if !ok {
+			return Quote{}, httpx.NotFound("Alamat pengiriman tidak ditemukan.")
+		}
+		if lat != nil && lng != nil {
+			coord = &catalog.Coord{Lat: *lat, Lng: *lng}
+		}
+		q.AddressID = &a
+	}
+
+	// Outlet (§5.26): pilihan user, atau yang buka & menjangkau alamat lalu terdekat.
+	store, err := s.pickStore(ctx, cat, strings.TrimSpace(in.StoreID), coord)
+	if err != nil {
+		return Quote{}, err
+	}
+	if !store.IsOpenAt(s.now(), s.cfg.Location) {
+		return Quote{}, httpx.Unprocessable("STORE_CLOSED", store.ClosedReason()+" Pilih outlet lain atau pesan nanti.")
+	}
+	if coord != nil && !store.Delivers(*coord) {
+		return Quote{}, &httpx.AppError{
+			Status: 422, Type: "OUT_OF_DELIVERY_AREA",
+			Message: fmt.Sprintf("Alamat kamu %.1f km dari outlet %s, di luar jangkauan antar (maks. %.0f km). Pilih outlet lain.",
+				store.DistanceKM(*coord), store.Name, store.RadiusKM),
+			Details: []httpx.FieldDetail{{Field: "store_id", Message: "di luar jangkauan"}},
+		}
+	}
+	q.StoreID, q.StoreName = store.ID, store.Name
+
+	// Harga sama di semua outlet; ketersediaan mengikuti outlet.
 	ids := make([]string, 0, len(in.Items))
 	for _, it := range in.Items {
 		ids = append(ids, it.ProductID)
 	}
-	products, err := catalog.NewRepository(db).ProductsByIDs(ctx, ids)
+	products, err := cat.ProductsByIDs(ctx, ids)
+	if err == nil {
+		err = cat.ApplyStoreAvailabilityMap(ctx, store.ID, products)
+	}
 	if err != nil {
 		return Quote{}, err
 	}
@@ -145,45 +201,13 @@ func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in
 		MinQuantity: rules.MinQuantity, MaxQuantity: rules.MaxQuantity, NoteMaxChars: rules.MaxNoteLength,
 	})
 	if err != nil {
-		return Quote{}, err
-	}
-
-	q := Quote{Lines: lines, Subtotal: subtotal}
-
-	// Outlet
-	q.StoreID = strings.TrimSpace(in.StoreID)
-	if q.StoreID == "" {
-		if q.StoreID, err = s.repo.DefaultStoreID(ctx, db); err != nil {
-			if database.IsNoRows(err) {
-				return Quote{}, httpx.Unprocessable("STORE_CLOSED", "Belum ada outlet yang tersedia.")
-			}
-			return Quote{}, err
-		}
-	}
-	store, err := s.repo.StoreByID(ctx, db, q.StoreID)
-	if err != nil {
-		if database.IsNoRows(err) {
-			return Quote{}, httpx.Validation("Outlet tidak ditemukan.", httpx.FieldDetail{Field: "store_id", Message: "tidak ditemukan"})
+		var appErr *httpx.AppError
+		if errors.As(err, &appErr) && appErr.Type == "PRODUCT_UNAVAILABLE" && strings.HasSuffix(appErr.Message, " sedang habis.") {
+			appErr.Message = strings.TrimSuffix(appErr.Message, " sedang habis.") + " sedang habis di outlet " + store.Name + "."
 		}
 		return Quote{}, err
 	}
-	if !store.IsOpen {
-		return Quote{}, httpx.Unprocessable("STORE_CLOSED", "Outlet "+store.Name+" sedang tutup.")
-	}
-
-	// Alamat (opsional)
-	if a := strings.TrimSpace(in.AddressID); a != "" {
-		ok := uuidRe.MatchString(a)
-		if ok {
-			if ok, err = s.repo.AddressBelongsTo(ctx, db, a, userID); err != nil {
-				return Quote{}, err
-			}
-		}
-		if !ok {
-			return Quote{}, httpx.NotFound("Alamat pengiriman tidak ditemukan.")
-		}
-		q.AddressID = &a
-	}
+	q.Lines, q.Subtotal = lines, subtotal
 
 	q.DeliveryFee = DeliveryFee(subtotal, rules.DeliveryFee, rules.FreeDeliveryMinSubtotal)
 
@@ -226,6 +250,29 @@ func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in
 	return q, nil
 }
 
+// pickStore: outlet dari store_id, atau pilihan otomatis untuk alamat ini.
+func (s *Service) pickStore(ctx context.Context, cat *catalog.Repository, storeID string, coord *catalog.Coord) (catalog.Store, error) {
+	if storeID != "" {
+		store, ok, err := cat.StoreByID(ctx, storeID, true)
+		if err != nil {
+			return catalog.Store{}, err
+		}
+		if !ok {
+			return catalog.Store{}, httpx.Validation("Outlet tidak ditemukan.", httpx.FieldDetail{Field: "store_id", Message: "tidak ditemukan"})
+		}
+		return store, nil
+	}
+	stores, err := cat.Stores(ctx)
+	if err != nil {
+		return catalog.Store{}, err
+	}
+	store, ok := catalog.PickStore(stores, coord, s.now(), s.cfg.Location)
+	if !ok {
+		return catalog.Store{}, httpx.Unprocessable("STORE_CLOSED", "Belum ada outlet yang tersedia.")
+	}
+	return store, nil
+}
+
 // Create: satu transaksi DB — validasi → hitung → insert orders + order_items
 // → update sold_count → tandai voucher. Idempotent lewat Idempotency-Key.
 func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Order, error) {
@@ -252,6 +299,9 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Or
 	}
 	if err := s.checkPaymentMethod(ctx, payment.Method); err != nil {
 		return Order{}, err
+	}
+	if payment.Method == "ONLINE" || (s.cfg.OnlinePayments && IsOnlineMethod(payment.Method)) {
+		return Order{}, httpx.Unprocessable("PAYMENT_REQUIRED", "Pesanan dengan pembayaran online dibuat setelah dibayar. Gunakan /v1/checkout.")
 	}
 
 	var orderID string
@@ -305,11 +355,11 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Or
 	return s.Get(ctx, userID, orderID)
 }
 
-func (s *Service) List(ctx context.Context, userID string, statuses []string, page httpx.Page) ([]Summary, int, error) {
-	if statuses == nil {
-		statuses = []string{}
+func (s *Service) List(ctx context.Context, userID string, filter ListFilter, page httpx.Page) ([]Summary, int, error) {
+	if filter.Statuses == nil {
+		filter.Statuses = []string{}
 	}
-	return s.repo.List(ctx, s.pool, userID, statuses, page.Limit, page.Offset())
+	return s.repo.List(ctx, s.pool, userID, filter, page.Limit, page.Offset())
 }
 
 func (s *Service) Get(ctx context.Context, userID, id string) (Order, error) {
@@ -325,7 +375,7 @@ func (s *Service) Get(ctx context.Context, userID, id string) (Order, error) {
 
 // Cancel: hanya untuk status PENDING.
 func (s *Service) Cancel(ctx context.Context, userID, id string) (Order, error) {
-	err := s.transition(ctx, userID, id, StatusCancelled, func(from string) error {
+	err := s.transition(ctx, userID, id, StatusCancelled, StatusMeta{}, func(from string) error {
 		switch from {
 		case StatusPending:
 			return nil
@@ -360,7 +410,7 @@ func CanTransition(from, to string) bool {
 
 // AdvanceStatus dipakai endpoint khusus dev untuk mensimulasikan outlet/kurir.
 func (s *Service) AdvanceStatus(ctx context.Context, userID, id, to string) (Order, error) {
-	err := s.transition(ctx, userID, id, to, func(from string) error {
+	err := s.transition(ctx, userID, id, to, StatusMeta{}, func(from string) error {
 		if !CanTransition(from, to) {
 			return httpx.Unprocessable("INVALID_STATUS_TRANSITION", fmt.Sprintf("Status tidak bisa diubah dari %s ke %s.", from, to))
 		}
@@ -369,10 +419,134 @@ func (s *Service) AdvanceStatus(ctx context.Context, userID, id, to string) (Ord
 	if err != nil {
 		return Order{}, err
 	}
+	o, err := s.Get(ctx, userID, id)
+	if err == nil {
+		s.notifyStatus(o, "")
+	}
+	return o, err
+}
+
+// notifyStatus: push "pesanan disiapkan / diantar / selesai / gagal" ke pemilik pesanan.
+func (s *Service) notifyStatus(o Order, note string) {
+	if s.cfg.Notifier == nil {
+		return
+	}
+	title, body := "", ""
+	switch o.Status {
+	case StatusProcessing:
+		title, body = "Pesanan sedang disiapkan 👨‍🍳", fmt.Sprintf("%s sedang disiapkan di outlet %s.", o.OrderNumber, o.Store.Name)
+	case StatusDelivering:
+		title, body = "Pesanan dalam perjalanan 🛵", fmt.Sprintf("Kurir sedang mengantar %s ke alamatmu.", o.OrderNumber)
+	case StatusCompleted:
+		title, body = "Pesanan selesai ✅", fmt.Sprintf("Selamat menikmati! Beri nilai pesanan %s, yuk.", o.OrderNumber)
+	case StatusFailed:
+		title, body = "Pesanan gagal", o.OrderNumber
+	case StatusCancelled:
+		title, body = "Pesanan dibatalkan", o.OrderNumber
+	default:
+		return
+	}
+	if note != "" {
+		body += ": " + note
+	} else if o.Status == StatusFailed || o.Status == StatusCancelled {
+		body += "."
+	}
+	s.cfg.Notifier.NotifyUser(o.UserID, push.Message{
+		Title: title, Body: body, ThreadID: o.ID,
+		Data: map[string]string{"type": "order_status", "order_id": o.ID, "status": o.Status},
+	})
+}
+
+// ===== Admin (§5.25) =====
+
+// IsFinal: status akhir yang tidak bisa diubah lagi.
+func IsFinal(status string) bool {
+	return status == StatusCompleted || status == StatusCancelled || status == StatusFailed
+}
+
+// statusRank: urutan alur normal pesanan.
+var statusRank = map[string]int{StatusPending: 0, StatusPaid: 1, StatusProcessing: 2, StatusDelivering: 3, StatusCompleted: 4}
+
+// CanAdminTransition: admin boleh memajukan status (boleh melompat, mis. PENDING → COMPLETED
+// = "sukses"), atau menandai GAGAL / BATAL selama pesanan belum selesai. Status akhir terkunci.
+func CanAdminTransition(from, to string) bool {
+	if IsFinal(from) || from == to {
+		return false
+	}
+	if to == StatusFailed || to == StatusCancelled {
+		return true
+	}
+	fr, ok1 := statusRank[from]
+	tr, ok2 := statusRank[to]
+	return ok1 && ok2 && tr > fr
+}
+
+// AdminNextStatuses: pilihan status di web admin untuk pesanan berstatus from.
+func AdminNextStatuses(from string) []string {
+	out := []string{}
+	for _, to := range AllStatuses {
+		if CanAdminTransition(from, to) {
+			out = append(out, to)
+		}
+	}
+	return out
+}
+
+// AdminSetStatus mengubah status pesanan milik user mana pun. GAGAL / BATAL wajib beri alasan;
+// sold_count & voucher dikembalikan seperti pembatalan biasa.
+func (s *Service) AdminSetStatus(ctx context.Context, id, to string, meta StatusMeta) (Order, string, error) {
+	if !uuidRe.MatchString(id) {
+		return Order{}, "", errOrderNotFound
+	}
+	meta.Note = strings.TrimSpace(meta.Note)
+	if (to == StatusFailed || to == StatusCancelled) && meta.Note == "" {
+		return Order{}, "", httpx.Validation("Alasan wajib diisi untuk status gagal / batal.",
+			httpx.FieldDetail{Field: "note", Message: "wajib diisi"})
+	}
+	userID, err := s.repo.OrderOwner(ctx, s.pool, id)
+	if database.IsNoRows(err) {
+		return Order{}, "", errOrderNotFound
+	}
+	if err != nil {
+		return Order{}, "", err
+	}
+	var previous string
+	err = s.transition(ctx, userID, id, to, meta, func(from string) error {
+		previous = from
+		if !CanAdminTransition(from, to) {
+			if IsFinal(from) {
+				return httpx.Unprocessable("INVALID_STATUS_TRANSITION", fmt.Sprintf("Pesanan sudah %s dan tidak bisa diubah lagi.", from))
+			}
+			return httpx.Unprocessable("INVALID_STATUS_TRANSITION", fmt.Sprintf("Status tidak bisa diubah dari %s ke %s.", from, to))
+		}
+		return nil
+	})
+	if err != nil {
+		return Order{}, "", err
+	}
+	o, err := s.Get(ctx, userID, id)
+	if err == nil {
+		s.notifyStatus(o, meta.Note)
+	}
+	return o, previous, err
+}
+
+// AdminGet: detail pesanan siapa pun.
+func (s *Service) AdminGet(ctx context.Context, id string) (Order, error) {
+	if !uuidRe.MatchString(id) {
+		return Order{}, errOrderNotFound
+	}
+	userID, err := s.repo.OrderOwner(ctx, s.pool, id)
+	if database.IsNoRows(err) {
+		return Order{}, errOrderNotFound
+	}
+	if err != nil {
+		return Order{}, err
+	}
 	return s.Get(ctx, userID, id)
 }
 
-func (s *Service) transition(ctx context.Context, userID, id, to string, check func(from string) error) error {
+func (s *Service) transition(ctx context.Context, userID, id, to string, meta StatusMeta, check func(from string) error) error {
 	if !uuidRe.MatchString(id) {
 		return errOrderNotFound
 	}
@@ -387,7 +561,7 @@ func (s *Service) transition(ctx context.Context, userID, id, to string, check f
 		if err := check(from); err != nil {
 			return err
 		}
-		if err := s.repo.SetStatus(ctx, tx, id, to); err != nil {
+		if err := s.repo.SetStatus(ctx, tx, id, to, meta); err != nil {
 			return err
 		}
 		if to == StatusCancelled || to == StatusFailed {
@@ -436,8 +610,15 @@ func (s *Service) Rate(ctx context.Context, userID, id string, rating int, comme
 	return s.Get(ctx, userID, id)
 }
 
-// checkPaymentMethod menolak metode yang dimatikan di app_config.payment_methods.
+// checkPaymentMethod menolak metode yang dimatikan di app_config.payment_methods
+// (atau lewat env: COD_ENABLED=false, ONLINE tanpa MIDTRANS_SERVER_KEY).
 func (s *Service) checkPaymentMethod(ctx context.Context, id string) error {
+	if id == "COD" && s.cfg.CODDisabled {
+		return httpx.Unprocessable("PAYMENT_METHOD_UNAVAILABLE", "Bayar di Tempat sedang tidak tersedia. Pilih metode lain.")
+	}
+	if id == "ONLINE" && !s.cfg.OnlinePayments {
+		return httpx.Unprocessable("PAYMENT_METHOD_UNAVAILABLE", "Pembayaran online sedang tidak tersedia. Pilih metode lain.")
+	}
 	methods, err := s.cfg.AppConfig.PaymentMethods(ctx, nil)
 	if err != nil || methods == nil {
 		return err // belum dikonfigurasi = semua metode (COD/QRIS/EWALLET) boleh

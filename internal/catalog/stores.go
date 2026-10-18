@@ -6,27 +6,42 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"time"
 
 	"trytuist-api/internal/httpx"
 )
 
 type StoreDTO struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Address    string   `json:"address"`
-	Lat        float64  `json:"lat"`
-	Lng        float64  `json:"lng"`
-	IsOpen     bool     `json:"is_open"`
-	DistanceKM *float64 `json:"distance_km"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	Lat         float64  `json:"lat"`
+	Lng         float64  `json:"lng"`
+	Phone       *string  `json:"phone"`
+	IsOpen      bool     `json:"is_open"`     // buka sekarang (jam buka + tidak tutup sementara)
+	OpensAt     string   `json:"opens_at"`    // "08:00"
+	ClosesAt    string   `json:"closes_at"`   // "22:00"
+	HoursLabel  string   `json:"hours_label"` // "08:00–22:00" | "24 jam"
+	RadiusKM    float64  `json:"delivery_radius_km"`
+	DistanceKM  *float64 `json:"distance_km"`
+	Deliverable *bool    `json:"is_deliverable"` // nil bila koordinat tidak dikirim
+	ClosedNote  *string  `json:"closed_note"`    // alasan tidak bisa pesan, nil bila buka
 }
 
-// StoreWithDistance: outlet + jarak (nil bila koordinat user tidak dikirim).
-type StoreWithDistance struct {
-	Store
-	DistanceKM *float64
+func ToStoreDTO(r RankedStore) StoreDTO {
+	d := StoreDTO{
+		ID: r.ID, Name: r.Name, Address: r.Address, Lat: r.Lat, Lng: r.Lng, Phone: r.Phone,
+		IsOpen: r.OpenNow, OpensAt: FormatClock(r.OpensAt), ClosesAt: FormatClock(r.ClosesAt),
+		HoursLabel: r.HoursLabel(), RadiusKM: r.RadiusKM, DistanceKM: r.DistanceKM, Deliverable: r.Deliverable,
+	}
+	if !r.OpenNow {
+		note := r.ClosedReason()
+		d.ClosedNote = &note
+	}
+	return d
 }
 
-// GET /v1/stores?lat=&lng= — bila koordinat dikirim, urut dari yang terdekat (outlet buka dulu).
+// GET /v1/stores?lat=&lng= — outlet aktif, yang buka & menjangkau alamat lebih dulu, lalu terdekat.
 func (h *Handler) Stores(w http.ResponseWriter, r *http.Request) {
 	coord, err := ParseCoord(r.URL.Query())
 	if err != nil {
@@ -38,10 +53,10 @@ func (h *Handler) Stores(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
-	sorted := SortByDistance(stores, coord)
-	out := make([]StoreDTO, len(sorted))
-	for i, s := range sorted {
-		out[i] = StoreDTO{ID: s.ID, Name: s.Name, Address: s.Address, Lat: s.Lat, Lng: s.Lng, IsOpen: s.IsOpen, DistanceKM: s.DistanceKM}
+	ranked := RankStores(stores, coord, time.Now(), httpx.Loc)
+	out := make([]StoreDTO, len(ranked))
+	for i, s := range ranked {
+		out[i] = ToStoreDTO(s)
 	}
 	httpx.JSON(w, http.StatusOK, out)
 }
@@ -62,26 +77,8 @@ func ParseCoord(q url.Values) (*Coord, error) {
 	return &Coord{Lat: lat, Lng: lng}, nil
 }
 
-// SortByDistance: tanpa koordinat urutan tetap (per id); dengan koordinat,
-// outlet buka lebih dulu lalu yang terdekat.
-func SortByDistance(stores []Store, c *Coord) []StoreWithDistance {
-	out := make([]StoreWithDistance, len(stores))
-	for i, s := range stores {
-		out[i] = StoreWithDistance{Store: s}
-		if c != nil {
-			d := math.Round(haversineKM(c.Lat, c.Lng, s.Lat, s.Lng)*10) / 10
-			out[i].DistanceKM = &d
-		}
-	}
-	if c != nil {
-		sort.SliceStable(out, func(i, j int) bool {
-			if out[i].IsOpen != out[j].IsOpen {
-				return out[i].IsOpen
-			}
-			return *out[i].DistanceKM < *out[j].DistanceKM
-		})
-	}
-	return out
+func sortStable[T any](s []T, less func(a, b T) bool) {
+	sort.SliceStable(s, func(i, j int) bool { return less(s[i], s[j]) })
 }
 
 func haversineKM(lat1, lng1, lat2, lng2 float64) float64 {

@@ -45,7 +45,15 @@ func (h *Handler) ListProducts(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
+	store, err := h.repo.StoreFromQuery(r.Context(), r.URL.Query().Get("store_id"))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
 	products, total, err := h.repo.ListProducts(r.Context(), filter)
+	if err == nil && store != nil {
+		err = h.repo.ApplyStoreAvailability(r.Context(), store.ID, products)
+	}
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -54,9 +62,33 @@ func (h *Handler) ListProducts(w http.ResponseWriter, r *http.Request) {
 		httpx.Meta{Page: filter.Page, Limit: filter.Limit, Total: total})
 }
 
-// GET /v1/products/{id}
+// GET /v1/promotions/popup — data: null bila tidak ada promo popup (§5.24).
+func (h *Handler) PopupDeal(w http.ResponseWriter, r *http.Request) {
+	d, ok, err := h.repo.PopupDeal(r.Context())
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	if !ok {
+		httpx.JSON(w, http.StatusOK, nil)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, ToPopupDealDTO(d))
+}
+
+// GET /v1/products/{id}?store_id=
 func (h *Handler) GetProduct(w http.ResponseWriter, r *http.Request) {
+	store, err := h.repo.StoreFromQuery(r.Context(), r.URL.Query().Get("store_id"))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
 	p, ok, err := h.repo.ProductByID(r.Context(), chi.URLParam(r, "id"))
+	if err == nil && ok && store != nil {
+		list := []Product{p}
+		err = h.repo.ApplyStoreAvailability(r.Context(), store.ID, list)
+		p = list[0]
+	}
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return

@@ -144,3 +144,21 @@ func TestRupiah(t *testing.T) {
 		}
 	}
 }
+
+// Produk promo: harga berlaku (Price) yang dipakai; extra opsi tetap ditambahkan.
+func TestBuildLines_DealPrice(t *testing.T) {
+	products := map[string]catalog.Product{
+		"P07": {ID: "P07", Name: "Nasi Goreng Spesial", Price: 19900, OriginalPrice: 32000, IsAvailable: true,
+			Options: []catalog.Option{{ID: "normal", Name: "Normal"}, {ID: "jumbo", Name: "Porsi Jumbo", ExtraPrice: 8000}}},
+	}
+	lines, subtotal, err := BuildLines([]ItemInput{{ProductID: "P07", OptionID: "jumbo", Quantity: 2}}, products, DefaultRules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines[0].UnitPrice != 27900 || subtotal != 55800 {
+		t.Fatalf("unit = %d, subtotal = %d; harap 27900 & 55800", lines[0].UnitPrice, subtotal)
+	}
+	if !products["P07"].OnDeal() || products["P07"].DiscountPercent() != 37 {
+		t.Fatal("P07 harus terdeteksi promo 37%")
+	}
+}

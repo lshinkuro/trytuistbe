@@ -2,14 +2,14 @@
 
 Backend untuk aplikasi iOS **TryTuist**. Kontraknya ada di [`API_PLAN.md`](API_PLAN.md); semua nama field JSON sama dengan DTO di iOS.
 
-Semua endpoint di plan (#1–#27, fase 1, 1b, 2, 3) sudah jalan dan dites.
+Semua endpoint di plan (#1–#50, fase 1 sampai 5c) sudah jalan dan dites, kecuali `GET /v1/admin/payments` (fase 5b).
 
 ## Jalankan di lokal (Postgres terinstal langsung di Mac)
 
 Butuh **Go 1.23+** dan **PostgreSQL 13+** yang sedang berjalan (`brew services start postgresql@16` atau Postgres.app).
 
 ```bash
-cd ~/Documents/iOS/TryTuistBe
+cd ~/Documents/iOS/trytuist-api
 make setup      # go mod tidy → buat .env → buat role+DB "trytuist" & "trytuist_test" → migrasi → seed
 make run        # http://localhost:8080
 ```
@@ -25,7 +25,7 @@ curl -s localhost:8080/v1/auth/login \
   -d '{"email":"kholis@gmail.com","password":"12345678"}'
 ```
 
-Akun demo (sama dengan `AuthMockDataSource`): `kholis@gmail.com / 12345678` dan `demo@trytuist.com / password123`.
+Akun demo (sama dengan `AuthMockDataSource`): `kholis@gmail.com / 12345678` dan `demo@trytuist.com / password123`. Akun web admin: `admin@trytuist.com / admin12345` (role `ADMIN`).
 
 > `make db-setup` memakai `psql -d postgres` dengan user Mac kamu (default Homebrew). Kalau Postgres-mu butuh user lain: `make db-setup PSQL="psql -U postgres"`. Kalau lebih suka Docker: `docker compose up -d`, lalu lewati `db-setup` (database `trytuist` sudah dibuat oleh container).
 
@@ -79,9 +79,14 @@ Semua di bawah `/v1` butuh header `X-API-Key`. 🔒 = butuh `Authorization: Bear
 | POST | `/v1/auth/register` · `/login` · `/refresh` | login: rate limit 5/menit/IP+email |
 | POST | `/v1/auth/logout` | 🔒 |
 | POST | `/v1/auth/google` | daftar/masuk dengan Google (`id_token`). 201 = akun baru, 200 = akun lama. Butuh `GOOGLE_CLIENT_IDS` |
-| GET | `/v1/banners` · `/categories` · `/products` · `/products/{id}` · `/stores?lat=&lng=` | |
+| GET | `/v1/banners` · `/categories` · `/products` · `/products/{id}` · `/stores?lat=&lng=` | produk: `?store_id=` → stok outlet itu · stores: buka → menjangkau → terdekat |
 | POST | `/v1/orders/quote` · `/v1/orders` | 🔒 `Idempotency-Key` opsional |
-| GET | `/v1/orders?status=&page=&limit=` · `/v1/orders/{id}` | 🔒 |
+| POST | `/v1/checkout` | 🔒 `Idempotency-Key` · COD → pesanan; Bayar Online → sesi Midtrans Snap (`redirect_url`), pesanan dibuat setelah lunas (§5.27) |
+| GET / POST | `/v1/payments?status=` · `/v1/payments/{id}` · `/v1/payments/{id}/cancel` | 🔒 · status sesi (server ikut cek ke Midtrans saat PENDING), batal |
+| POST | `/v1/payments/midtrans/notification` | **tanpa** `X-API-Key`; webhook Midtrans, divalidasi `signature_key` |
+| PUT | `/v1/me/devices` | 🔒 · daftarkan device token APNs (§5.28) |
+| POST | `/v1/devices/unregister` | tanpa login · berhenti menerima push (logout) |
+| GET | `/v1/orders?status=&from=&to=&sort=asc/desc&page=&limit=` · `/v1/orders/{id}` | 🔒 · list berisi `can_rate` |
 | POST | `/v1/orders/{id}/cancel` · `/v1/orders/{id}/rating` | 🔒 |
 | GET/PATCH | `/v1/me` | 🔒 |
 | GET/POST | `/v1/me/addresses` · PATCH/DELETE `/v1/me/addresses/{id}` | 🔒 |
@@ -92,11 +97,18 @@ Semua di bawah `/v1` butuh header `X-API-Key`. 🔒 = butuh `Authorization: Bear
 | DELETE | `/v1/me/payment-methods/{id}` | 🔒 · hanya e-wallet; bila metode utama → kembali ke COD |
 | GET | `/v1/help?q=` | Pusat Bantuan: topik + FAQ + kontak (tabel `help_topics`, `help_articles`, key `help_contacts`) |
 | GET | `/v1/legal/{slug}` | `privacy-policy` · `terms` (tabel `legal_documents`), `Cache-Control: max-age=3600` |
-| GET | `/v1/home?lat=&lng=` | 🔒* |
+| GET | `/v1/home?lat=&lng=&store_id=` | 🔒* |
 | GET | `/v1/app-config` | `Cache-Control: max-age=300` + `ETag` (304 bila `If-None-Match` cocok) |
+| GET | `/v1/promotions/popup` | popup promo harga produk di Beranda (tabel `product_deals`) · `data: null` bila tidak ada |
 | GET | `/v1/promotions/featured` | 🔒* · `data: null` bila tidak ada promo |
 | POST | `/v1/subscriptions/{plan_id}/activate` | 🔒 · 201, 409 `ALREADY_SUBSCRIBED` |
 | POST | `/v1/dev/orders/{id}/status` | 🔒 **hanya `APP_ENV=dev`** |
+| GET | `/v1/admin/me` · `/dashboard` · `/orders[/{id}]` · `/products[/{id}]` · `/deals` · `/customers` · `/audit-logs` | 🛡 role ADMIN (web admin `trytuistadmin`, §5.25) |
+| PATCH | `/v1/admin/orders/{id}/status` · `/v1/admin/products/{id}` · `/v1/admin/deals/{id}` | 🛡 · ubah status (sukses/gagal/batal), harga & stok, promo |
+| POST | `/v1/admin/products` | 🛡 · tambah menu (kategori, harga, foto, varian) → 201 |
+| POST / DELETE | `/v1/admin/deals[/{id}]` | 🛡 · buat / hapus promo |
+| GET / POST / PATCH | `/v1/admin/stores[/{id}]` | 🛡 · outlet: tambah, jam buka, radius antar, tutup sementara (§5.26) |
+| PUT | `/v1/admin/stores/{id}/products/{product_id}` | 🛡 · `{ is_available }` stok menu per outlet |
 
 ### Mengatur Beranda & konfigurasi tanpa update app
 
@@ -134,12 +146,14 @@ curl -s localhost:8080/v1/dev/orders/<order_id>/status \
 - **Migrasi lewat `go run ./cmd/migrate`**, tidak perlu install CLI `golang-migrate`. Nama file dan tabel `schema_migrations` tetap kompatibel dengan golang-migrate.
 - **Router di `internal/server/`**, bukan `httpx/router.go`, supaya tidak ada import cycle (`httpx` dipakai oleh semua modul).
 - **Voucher contoh** di seed: `HEMAT10` (10%, maks. Rp 20.000, min. Rp 30.000), `DISKON15K`, `KOPIPAGI`. Voucher sekali pakai per user, dan kembali bisa dipakai bila pesanan dibatalkan.
-- **`store_id` boleh kosong** di quote/checkout: otomatis pakai outlet buka pertama (ST01), supaya iOS bisa checkout sebelum ada fitur pilih outlet.
+- **Notifikasi push (§5.28)**: isi `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_KEY_FILE` (file `.p8` dari developer.apple.com → Keys). Tanpa itu, push hanya dicatat di log (`push (APNs belum dikonfigurasi, hanya log)`). Tes: `POST /v1/dev/push-test` dengan token login.
+- **Pembayaran online (§5.27)**: isi `MIDTRANS_SERVER_KEY` (sandbox `SB-Mid-server-…`) di `.env` untuk mengaktifkan "Bayar Online". Webhook Midtrans butuh URL publik: jalankan `cloudflared tunnel --url http://localhost:8080` dan isi Payment Notification URL di dashboard sandbox dengan `https://<tunnel>/v1/payments/midtrans/notification`. Tanpa tunnel pun status tetap terbaca karena server mengecek ke Midtrans setiap iOS polling. Bayar di sandbox pakai simulator (`https://simulator.sandbox.midtrans.com/v2/qris/index`, kartu `4811 1111 1111 1114` / CVV `123` / OTP `112233`).
+- **Multi-outlet (§5.26)**: harga sama di semua outlet; stok, jam buka, dan radius antar per outlet. `store_id` boleh kosong di quote/checkout: server memilih outlet yang buka, menjangkau alamat pesanan, lalu terdekat. Outlet tutup → `422 STORE_CLOSED`, alamat di luar radius → `422 OUT_OF_DELIVERY_AREA`. Seed: ST01 & ST02 buka 24 jam, ST03 Kelapa Gading 10:00–22:00; Ramen Pedas habis di ST02, Chocolate Cake habis di ST03.
 - **Opsi produk**: produk yang punya varian tapi `option_id` kosong otomatis memakai varian pertama (Regular/Normal).
 - **`order_rules` di `app_config` jadi sumber aturan order di server juga** (batas jumlah, panjang catatan, ongkir, gratis ongkir), jadi angka di app dan hasil quote/checkout selalu sama. `DELIVERY_FEE` / `FREE_DELIVERY_MIN_SUBTOTAL` di `.env` hanya cadangan bila key belum ada.
 - **Gratis ongkir awalnya nonaktif** (`free_delivery_min_subtotal: 0`, contoh di plan 50000) supaya total server sama dengan Keranjang iOS yang masih hardcode ongkir. Aktifkan setelah iOS membaca `order_rules` (lihat SQL di atas).
 - **Metode bayar yang `is_enabled: false`** ditolak saat checkout: `422 PAYMENT_METHOD_UNAVAILABLE` (EWALLET nonaktif secara default).
-- **`/v1/home`**: section produk yang kosong tidak dikirim; `see_all` hanya ada di section produk. Tanpa `lat/lng`, `store` = outlet buka pertama (sama dengan default checkout).
+- **`/v1/home`**: section produk yang kosong tidak dikirim; `see_all` hanya ada di section produk. `?store_id=` memakai outlet itu (stok ikut outlet); tanpa itu, `store` = outlet terbaik untuk `lat/lng` (sama dengan default checkout).
 - **Aktivasi langganan** langsung berhasil (belum ada pembayaran); berlaku 1 periode (DAILY = 24 jam, WEEKLY = 7 hari, MONTHLY = 1 bulan). Bisa diaktifkan lagi setelah kedaluwarsa.
 - Error tambahan: `422 PAYMENT_METHOD_UNAVAILABLE`, `422 STORE_CLOSED`, `422 ORDER_NOT_CANCELLABLE`, `422 ORDER_NOT_RATABLE`, `409 ALREADY_RATED`, `422 INVALID_STATUS_TRANSITION` (dev).
 - Detail pesanan menambahkan `voucher_code`, `rating`, `can_cancel`, `can_rate`; quote menambahkan `store_id` & `voucher_code`. iOS mengabaikan field yang tidak dikenal.

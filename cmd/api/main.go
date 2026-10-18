@@ -44,9 +44,19 @@ func run() error {
 	}
 	defer pool.Close()
 
+	app := server.NewApp(cfg, pool)
+	if app.Push.Enabled() {
+		slog.Info("push APNs aktif", "key_id", cfg.APNsKeyID, "team_id", cfg.APNsTeamID)
+	} else {
+		slog.Info("push APNs nonaktif (APNS_KEY_FILE kosong): notifikasi hanya dicatat di log")
+	}
+	if app.Payments.Enabled() {
+		slog.Info("pembayaran online Midtrans aktif", "production", cfg.MidtransIsProduction, "public_base_url", cfg.PublicBaseURL)
+		go app.Payments.RunSweeper(ctx, time.Minute)
+	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           server.NewRouter(cfg, pool),
+		Handler:           app.Handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      35 * time.Second,

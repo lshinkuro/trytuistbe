@@ -55,12 +55,21 @@ func (r *Repository) ActiveCategories(ctx context.Context) ([]Category, error) {
 	})
 }
 
-const productColumns = `p.id, p.category_id, p.name, p.description, p.price, COALESCE(p.image_url, ''),
+// activeDealPrice: harga deal termurah yang sedang berlaku untuk p (NULL bila tidak ada).
+// Deal yang tidak lebih murah dari harga normal diabaikan.
+const activeDealPrice = `(SELECT min(d.deal_price) FROM product_deals d
+	WHERE d.product_id = p.id AND d.is_active AND d.starts_at <= now() AND d.ends_at > now()
+	  AND d.deal_price < p.price)`
+
+// effectivePrice: harga yang dibayar sekarang (dipakai juga untuk sort harga).
+const effectivePrice = `COALESCE(` + activeDealPrice + `, p.price)`
+
+const productColumns = `p.id, p.category_id, p.name, p.description, ` + effectivePrice + `, p.price, COALESCE(p.image_url, ''),
 	p.rating::float8, p.sold_count, p.is_available, p.is_best_seller, p.updated_at`
 
 func scanProduct(row pgx.CollectableRow) (Product, error) {
 	var p Product
-	err := row.Scan(&p.ID, &p.CategoryID, &p.Name, &p.Description, &p.Price, &p.ImageURL,
+	err := row.Scan(&p.ID, &p.CategoryID, &p.Name, &p.Description, &p.Price, &p.OriginalPrice, &p.ImageURL,
 		&p.Rating, &p.SoldCount, &p.IsAvailable, &p.IsBestSeller, &p.UpdatedAt)
 	return p, err
 }
@@ -101,9 +110,9 @@ func (r *Repository) ListProducts(ctx context.Context, f ProductFilter) ([]Produ
 	case "rating":
 		order = "p.rating DESC, p.sold_count DESC, p.sort_order"
 	case "price_asc":
-		order = "p.price ASC, p.sort_order"
+		order = effectivePrice + " ASC, p.sort_order"
 	case "price_desc":
-		order = "p.price DESC, p.sort_order"
+		order = effectivePrice + " DESC, p.sort_order"
 	}
 	limit := arg(f.Limit)
 	offset := arg((f.Page - 1) * f.Limit)
@@ -154,6 +163,39 @@ func (r *Repository) ProductsByIDs(ctx context.Context, ids []string) (map[strin
 		out[p.ID] = p
 	}
 	return out, nil
+}
+
+// PopupDeal: deal popup Beranda yang sedang berlaku; ok=false bila tidak ada.
+// Produk habis / kategori nonaktif dilewati supaya popup tidak berujung "tidak tersedia".
+func (r *Repository) PopupDeal(ctx context.Context) (Deal, bool, error) {
+	var d Deal
+	var productID string
+	var image *string
+	err := r.db.QueryRow(ctx, `
+		SELECT d.id, d.title, d.subtitle, d.badge, d.image_url, d.ends_at, d.product_id
+		FROM product_deals d
+		JOIN products p ON p.id = d.product_id
+		JOIN categories c ON c.id = p.category_id
+		WHERE d.is_active AND d.show_as_popup AND d.starts_at <= now() AND d.ends_at > now()
+		  AND d.deal_price < p.price AND p.is_available AND c.is_active
+		ORDER BY d.sort_order, d.ends_at, d.id
+		LIMIT 1`).Scan(&d.ID, &d.Title, &d.Subtitle, &d.Badge, &image, &d.EndsAt, &productID)
+	if database.IsNoRows(err) {
+		return Deal{}, false, nil
+	}
+	if err != nil {
+		return Deal{}, false, err
+	}
+	p, ok, err := r.ProductByID(ctx, productID)
+	if err != nil || !ok {
+		return Deal{}, false, err
+	}
+	d.Product = p
+	d.ImageURL = p.ImageURL
+	if image != nil && *image != "" {
+		d.ImageURL = *image
+	}
+	return d, true, nil
 }
 
 // FavoriteProducts: produk favorit user, terbaru di atas.
@@ -239,25 +281,4 @@ func (r *Repository) SectionProducts(ctx context.Context, rule string, manualIDs
 		return nil, err
 	}
 	return list, r.attachOptions(ctx, list)
-}
-
-type Store struct {
-	ID      string
-	Name    string
-	Address string
-	Lat     float64
-	Lng     float64
-	IsOpen  bool
-}
-
-func (r *Repository) Stores(ctx context.Context) ([]Store, error) {
-	rows, err := r.db.Query(ctx, `SELECT id, name, address, lat, lng, is_open FROM stores ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Store, error) {
-		var s Store
-		err := row.Scan(&s.ID, &s.Name, &s.Address, &s.Lat, &s.Lng, &s.IsOpen)
-		return s, err
-	})
 }

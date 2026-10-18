@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -29,7 +30,7 @@ type quoteRequest struct {
 type createRequest struct {
 	quoteRequest
 	// Kosong = pakai metode utama user. payment_method_id = "COD" | "QRIS" | uuid e-wallet tersimpan.
-	PaymentMethod   string `json:"payment_method" validate:"omitempty,oneof=COD QRIS EWALLET"`
+	PaymentMethod   string `json:"payment_method" validate:"omitempty,oneof=COD QRIS EWALLET ONLINE"`
 	PaymentMethodID string `json:"payment_method_id" validate:"max=64"`
 	Note            string `json:"note" validate:"max=255"`
 }
@@ -70,6 +71,7 @@ type LineDTO struct {
 
 type QuoteDTO struct {
 	StoreID     string    `json:"store_id"`
+	StoreName   string    `json:"store_name"`
 	Items       []LineDTO `json:"items"`
 	Subtotal    int64     `json:"subtotal"`
 	DeliveryFee int64     `json:"delivery_fee"`
@@ -88,6 +90,7 @@ type OrderSummaryDTO struct {
 	TotalPrice  int64  `json:"total_price"`
 	Qty         int    `json:"qty"`
 	Status      string `json:"status"`
+	CanRate     bool   `json:"can_rate"`
 }
 
 type StoreDTO struct {
@@ -108,8 +111,9 @@ type AddressDTO struct {
 }
 
 type StatusEventDTO struct {
-	Status string `json:"status"`
-	At     string `json:"at"`
+	Status string  `json:"status"`
+	At     string  `json:"at"`
+	Note   *string `json:"note,omitempty"` // alasan dari admin (mis. pesanan gagal)
 }
 
 type RatingDTO struct {
@@ -157,7 +161,7 @@ func toLineDTOs(lines []Line) []LineDTO {
 
 func toQuoteDTO(q Quote) QuoteDTO {
 	dto := QuoteDTO{
-		StoreID: q.StoreID, Items: toLineDTOs(q.Lines),
+		StoreID: q.StoreID, StoreName: q.StoreName, Items: toLineDTOs(q.Lines),
 		Subtotal: q.Subtotal, DeliveryFee: q.DeliveryFee, Discount: q.Discount, Total: q.Total,
 	}
 	if q.Voucher != nil {
@@ -173,7 +177,7 @@ func toSummaryDTO(s Summary) OrderSummaryDTO {
 	}
 	return OrderSummaryDTO{
 		OrderID: s.ID, OrderNumber: s.OrderNumber, StoreName: s.StoreName, ProductName: name,
-		CreatedAt: httpx.ISO(s.CreatedAt), TotalPrice: s.Total, Qty: s.Qty, Status: s.Status,
+		CreatedAt: httpx.ISO(s.CreatedAt), TotalPrice: s.Total, Qty: s.Qty, Status: s.Status, CanRate: s.CanRate,
 	}
 }
 
@@ -202,7 +206,7 @@ func ToOrderDTO(o Order) OrderDTO {
 	}
 	dto.StatusHistory = make([]StatusEventDTO, len(o.History))
 	for i, e := range o.History {
-		dto.StatusHistory[i] = StatusEventDTO{Status: e.Status, At: httpx.ISO(e.At)}
+		dto.StatusHistory[i] = StatusEventDTO{Status: e.Status, At: httpx.ISO(e.At), Note: e.Note}
 	}
 	if r := o.Rating; r != nil {
 		dto.Rating = &RatingDTO{Rating: r.Rating, Comment: r.Comment, CreatedAt: httpx.ISO(r.CreatedAt)}
@@ -254,7 +258,8 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	httpx.JSONMessage(w, http.StatusCreated, "Pesanan diterima", ToOrderDTO(o))
 }
 
-// GET /v1/orders 🔒 — ?status=PENDING,PROCESSING&page=&limit=
+// GET /v1/orders 🔒 — ?status=PENDING,PROCESSING&from=&to=&sort=asc|desc&page=&limit=
+// from/to: RFC3339 (iOS mengirim awal hari di zona waktu perangkat), rentang [from, to).
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page, err := httpx.ParsePage(q, 20)
@@ -278,7 +283,30 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 			statuses = append(statuses, s)
 		}
 	}
-	list, total, err := h.svc.List(r.Context(), httpx.UserID(r.Context()), statuses, page)
+	filter := ListFilter{Statuses: statuses, Oldest: q.Get("sort") == "asc"}
+	var details []httpx.FieldDetail
+	for _, p := range []struct {
+		field string
+		dst   **time.Time
+	}{{"from", &filter.From}, {"to", &filter.To}} {
+		field, dst := p.field, p.dst
+		if v := q.Get(field); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				details = append(details, httpx.FieldDetail{Field: field, Message: "format waktu harus RFC3339"})
+				continue
+			}
+			*dst = &t
+		}
+	}
+	if s := q.Get("sort"); s != "" && s != "asc" && s != "desc" {
+		details = append(details, httpx.FieldDetail{Field: "sort", Message: "harus asc atau desc"})
+	}
+	if len(details) > 0 {
+		httpx.FromError(w, r, httpx.Validation("Parameter tidak valid.", details...))
+		return
+	}
+	list, total, err := h.svc.List(r.Context(), httpx.UserID(r.Context()), filter, page)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return

@@ -31,7 +31,7 @@ var (
 	// Nomor HP Indonesia: 08xx / 628xx / +628xx, total 10–15 digit.
 	ewalletNumberRe           = regexp.MustCompile(`^(?:\+?62|0)8[0-9]{7,12}$`)
 	errPaymentMethodNotFound  = httpx.NotFound("Metode pembayaran tidak ditemukan.")
-	builtinPaymentMethodTypes = map[string]bool{"COD": true, "QRIS": true}
+	builtinPaymentMethodTypes = map[string]bool{"COD": true, "QRIS": true, "ONLINE": true}
 )
 
 // ===== Model & repository =====
@@ -106,10 +106,31 @@ type PaymentService struct {
 	pool      *pgxpool.Pool
 	repo      Repository
 	appConfig *appconfig.Repository
+	avail     PaymentAvailability
 }
 
-func NewPaymentService(pool *pgxpool.Pool, appConfig *appconfig.Repository) *PaymentService {
-	return &PaymentService{pool: pool, appConfig: appConfig}
+// PaymentAvailability: saklar dari env (§5.27).
+//   - Online: Midtrans aktif → "Bayar Online" tersedia; QRIS & e-wallet tersimpan disembunyikan
+//     dari pilihan (keduanya kini dibayar lewat Bayar Online).
+//   - CODDisabled: COD_ENABLED=false.
+type PaymentAvailability struct {
+	Online      bool
+	CODDisabled bool
+}
+
+func NewPaymentService(pool *pgxpool.Pool, appConfig *appconfig.Repository, avail ...PaymentAvailability) *PaymentService {
+	s := &PaymentService{pool: pool, appConfig: appConfig}
+	if len(avail) > 0 {
+		s.avail = avail[0]
+	}
+	return s
+}
+
+func (s *PaymentService) fallbackDefault() string {
+	if s.avail.Online {
+		return "ONLINE"
+	}
+	return defaultBuiltinMethod
 }
 
 // PaymentOverview: semua yang dibutuhkan screen Metode Pembayaran dalam satu response.
@@ -136,11 +157,24 @@ func (s *PaymentService) catalog(ctx context.Context) (builtins []appconfig.Paym
 	ewallet = appconfig.PaymentMethod{ID: "EWALLET", Name: "E-Wallet", Icon: "wallet.pass", IsEnabled: false}
 	for _, m := range methods {
 		switch {
+		case m.ID == "ONLINE":
+			if !s.avail.Online {
+				continue // Midtrans belum dipasang: tidak ditampilkan sama sekali
+			}
+			builtins = append(builtins, m)
+		case m.ID == "QRIS" && s.avail.Online:
+			continue // QRIS kini salah satu channel Bayar Online
+		case m.ID == "COD" && s.avail.CODDisabled:
+			m.IsEnabled = false
+			builtins = append(builtins, m)
 		case builtinPaymentMethodTypes[m.ID]:
 			builtins = append(builtins, m)
 		case m.ID == "EWALLET":
 			ewallet = m
 		}
+	}
+	if s.avail.Online {
+		ewallet.IsEnabled = false // e-wallet dibayar lewat Bayar Online (GoPay, ShopeePay)
 	}
 	providers, err = s.appConfig.EWalletProviders(ctx)
 	return builtins, ewallet, providers, err
@@ -163,9 +197,12 @@ func (s *PaymentService) Overview(ctx context.Context, userID string) (PaymentOv
 		return PaymentOverview{}, err
 	}
 	out := PaymentOverview{DefaultID: def, Builtins: builtins, EWallet: ewallet, Saved: saved, Providers: providers}
-	// Default menunjuk metode yang sudah tidak ada / dimatikan → tampilkan COD sebagai utama.
+	// Default menunjuk metode yang sudah tidak ada / dimatikan → COD (atau Bayar Online bila aktif).
 	if !out.isUsable(def) {
-		out.DefaultID = defaultBuiltinMethod
+		out.DefaultID = s.fallbackDefault()
+		if !out.isUsable(out.DefaultID) && out.isUsable("COD") {
+			out.DefaultID = "COD"
+		}
 	}
 	return out, nil
 }

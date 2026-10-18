@@ -50,9 +50,11 @@ type AddressDTO struct {
 }
 
 type StoreDTO struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	IsOpen bool   `json:"is_open"`
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	IsOpen     bool    `json:"is_open"` // buka sekarang
+	HoursLabel string  `json:"hours_label"`
+	ClosedNote *string `json:"closed_note"`
 }
 
 type HomeDTO struct {
@@ -111,22 +113,27 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Outlet: pilihan user (?store_id=), atau yang buka & menjangkau lokasi user lalu terdekat.
+	// Semua tutup: tetap dikirim dengan is_open=false supaya iOS bisa memberi label "Tutup".
+	storeID := ""
 	stores, err := h.catalog.Stores(ctx)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
-	for _, s := range catalog.SortByDistance(stores, coord) {
-		if s.IsOpen {
-			out.Store = &StoreDTO{ID: s.ID, Name: s.Name, IsOpen: true}
-			break
-		}
+	if chosen, err := h.catalog.StoreFromQuery(ctx, r.URL.Query().Get("store_id")); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	} else if chosen != nil {
+		stores = []catalog.Store{*chosen}
 	}
-	if out.Store == nil && len(stores) > 0 { // semua tutup: tetap tampilkan, iOS bisa memberi label "Tutup"
-		out.Store = &StoreDTO{ID: stores[0].ID, Name: stores[0].Name, IsOpen: false}
+	if s, ok := catalog.PickStore(stores, coord, h.now(), h.loc); ok {
+		dto := catalog.ToStoreDTO(catalog.RankStores([]catalog.Store{s}, coord, h.now(), h.loc)[0])
+		out.Store = &StoreDTO{ID: dto.ID, Name: dto.Name, IsOpen: dto.IsOpen, HoursLabel: dto.HoursLabel, ClosedNote: dto.ClosedNote}
+		storeID = s.ID
 	}
 
-	if out.Sections, err = h.sections(ctx); err != nil {
+	if out.Sections, err = h.sections(ctx, storeID); err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
@@ -154,7 +161,7 @@ func (h *Handler) fillUser(ctx context.Context, uid string, out *HomeDTO) error 
 	return nil
 }
 
-func (h *Handler) sections(ctx context.Context) ([]map[string]any, error) {
+func (h *Handler) sections(ctx context.Context, storeID string) ([]map[string]any, error) {
 	rows, err := h.pool.Query(ctx, `
 		SELECT id, type, title, rule, COALESCE(product_ids, '{}'), item_limit, see_all
 		FROM home_sections WHERE is_active ORDER BY sort_order, id`)
@@ -198,9 +205,13 @@ func (h *Handler) sections(ctx context.Context) ([]map[string]any, error) {
 				rule = *d.Rule
 			}
 			products, err := h.catalog.SectionProducts(ctx, rule, d.ProductIDs, d.Limit)
+			if err == nil {
+				err = h.catalog.ApplyStoreAvailability(ctx, storeID, products)
+			}
 			if err != nil {
 				return nil, err
 			}
+			products = availableOnly(products) // habis di outlet ini → tidak ditampilkan di Beranda
 			if len(products) == 0 {
 				continue // section produk kosong tidak dikirim
 			}
@@ -212,6 +223,16 @@ func (h *Handler) sections(ctx context.Context) ([]map[string]any, error) {
 		out = append(out, sec)
 	}
 	return out, nil
+}
+
+func availableOnly(in []catalog.Product) []catalog.Product {
+	out := in[:0]
+	for _, p := range in {
+		if p.IsAvailable {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func head[T any](s []T, n int) []T {

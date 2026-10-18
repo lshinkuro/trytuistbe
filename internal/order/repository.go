@@ -43,6 +43,15 @@ type Address struct {
 type StatusEvent struct {
 	Status string
 	At     time.Time
+	Note   *string // alasan dari admin, mis. "Pembayaran ditolak"
+	// ChangedBy: nama admin yang mengubah; nil = sistem / user sendiri.
+	ChangedBy *string
+}
+
+// StatusMeta: keterangan perubahan status (dari web admin).
+type StatusMeta struct {
+	Note    string
+	ActorID string // id admin; "" = sistem / user sendiri
 }
 
 type Rating struct {
@@ -86,6 +95,14 @@ type Summary struct {
 	Total       int64
 	Status      string
 	CreatedAt   time.Time
+	CanRate     bool
+}
+
+// ListFilter: filter riwayat pesanan user. From/To nil = tanpa batas; rentang [From, To).
+type ListFilter struct {
+	Statuses []string
+	From, To *time.Time
+	Oldest   bool // urut created_at ASC (default DESC)
 }
 
 type Repository struct{}
@@ -97,11 +114,14 @@ func (Repository) StoreByID(ctx context.Context, db database.DBTX, id string) (S
 	return s, err
 }
 
-// DefaultStoreID: outlet buka pertama (dipakai bila iOS belum mengirim store_id).
-func (Repository) DefaultStoreID(ctx context.Context, db database.DBTX) (string, error) {
-	var id string
-	err := db.QueryRow(ctx, `SELECT id FROM stores ORDER BY is_open DESC, id LIMIT 1`).Scan(&id)
-	return id, err
+// AddressCoord: alamat milik user? + koordinatnya (boleh kosong).
+func (Repository) AddressCoord(ctx context.Context, db database.DBTX, id, userID string) (bool, *float64, *float64, error) {
+	var lat, lng *float64
+	err := db.QueryRow(ctx, `SELECT lat, lng FROM addresses WHERE id = $1 AND user_id = $2`, id, userID).Scan(&lat, &lng)
+	if database.IsNoRows(err) {
+		return false, nil, nil, nil
+	}
+	return err == nil, lat, lng, err
 }
 
 func (Repository) AddressBelongsTo(ctx context.Context, db database.DBTX, id, userID string) (bool, error) {
@@ -181,10 +201,18 @@ type insertOrder struct {
 	Payment        PaymentChoice
 	Note           *string
 	IdempotencyKey *string
+	// Pembayaran online (§5.27): pesanan langsung PAID & ditautkan ke payments.
+	Status      string  // "" = PENDING
+	PaymentID   *string // payments.id
+	HistoryNote *string // mis. "Dibayar via GoPay"
 }
 
 func (Repository) InsertOrder(ctx context.Context, tx pgx.Tx, in insertOrder) (string, error) {
 	q := in.Quote
+	status := in.Status
+	if status == "" {
+		status = StatusPending
+	}
 	var voucherID *string
 	if q.Voucher != nil {
 		voucherID = &q.Voucher.ID
@@ -193,12 +221,12 @@ func (Repository) InsertOrder(ctx context.Context, tx pgx.Tx, in insertOrder) (s
 	err := tx.QueryRow(ctx, `
 		INSERT INTO orders (order_number, user_id, store_id, address_id, subtotal, delivery_fee, discount, total,
 		                    voucher_id, payment_method, note, idempotency_key,
-		                    payment_account_id, payment_provider, payment_account_masked)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		                    payment_account_id, payment_provider, payment_account_masked, status, payment_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::order_status, $17)
 		RETURNING id::text`,
 		in.OrderNumber, in.UserID, q.StoreID, q.AddressID, q.Subtotal, q.DeliveryFee, q.Discount, q.Total,
 		voucherID, in.Payment.Method, in.Note, in.IdempotencyKey,
-		in.Payment.AccountID, in.Payment.Provider, in.Payment.AccountMasked).Scan(&id)
+		in.Payment.AccountID, in.Payment.Provider, in.Payment.AccountMasked, status, in.PaymentID).Scan(&id)
 	if err != nil {
 		return "", err
 	}
@@ -210,7 +238,7 @@ func (Repository) InsertOrder(ctx context.Context, tx pgx.Tx, in insertOrder) (s
 			id, l.ProductID, l.ProductName, l.OptionID, l.OptionName, l.UnitPrice, l.Quantity, l.Note, l.Subtotal, i)
 		batch.Queue(`UPDATE products SET sold_count = sold_count + $2 WHERE id = $1`, l.ProductID, l.Quantity)
 	}
-	batch.Queue(`INSERT INTO order_status_history (order_id, status) VALUES ($1, 'PENDING')`, id)
+	batch.Queue(`INSERT INTO order_status_history (order_id, status, note) VALUES ($1, $2::order_status, $3)`, id, status, in.HistoryNote)
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return "", err
 	}
@@ -224,12 +252,20 @@ func (Repository) OrderStatusForUpdate(ctx context.Context, tx pgx.Tx, id, userI
 	return status, voucherID, err
 }
 
-func (Repository) SetStatus(ctx context.Context, tx pgx.Tx, id, status string) error {
+func (Repository) SetStatus(ctx context.Context, tx pgx.Tx, id, status string, meta StatusMeta) error {
 	if _, err := tx.Exec(ctx, `UPDATE orders SET status = $2::order_status, updated_at = now() WHERE id = $1`, id, status); err != nil {
 		return err
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO order_status_history (order_id, status) VALUES ($1, $2::order_status)`, id, status)
+	_, err := tx.Exec(ctx, `INSERT INTO order_status_history (order_id, status, note, changed_by)
+		VALUES ($1, $2::order_status, NULLIF($3, ''), NULLIF($4, '')::uuid)`, id, status, meta.Note, meta.ActorID)
 	return err
+}
+
+// OrderOwner: user pemilik pesanan; pgx.ErrNoRows bila tidak ada.
+func (Repository) OrderOwner(ctx context.Context, db database.DBTX, id string) (string, error) {
+	var userID string
+	err := db.QueryRow(ctx, `SELECT user_id::text FROM orders WHERE id = $1`, id).Scan(&userID)
+	return userID, err
 }
 
 // RevertSoldCount dipanggil saat pesanan batal/gagal.
@@ -261,17 +297,22 @@ func (Repository) RecalcProductRatings(ctx context.Context, tx pgx.Tx, orderID s
 	return err
 }
 
-func (Repository) List(ctx context.Context, db database.DBTX, userID string, statuses []string, limit, offset int) ([]Summary, int, error) {
+func (Repository) List(ctx context.Context, db database.DBTX, userID string, f ListFilter, limit, offset int) ([]Summary, int, error) {
+	const where = `o.user_id = $1 AND (cardinality($2::text[]) = 0 OR o.status::text = ANY($2))
+		AND ($3::timestamptz IS NULL OR o.created_at >= $3) AND ($4::timestamptz IS NULL OR o.created_at < $4)`
 	var total int
-	if err := db.QueryRow(ctx, `
-		SELECT count(*) FROM orders
-		WHERE user_id = $1 AND (cardinality($2::text[]) = 0 OR status::text = ANY($2))`,
-		userID, statuses).Scan(&total); err != nil {
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM orders o WHERE `+where,
+		userID, f.Statuses, f.From, f.To).Scan(&total); err != nil {
 		return nil, 0, err
+	}
+	dir := "DESC"
+	if f.Oldest {
+		dir = "ASC"
 	}
 	rows, err := db.Query(ctx, `
 		SELECT o.id::text, o.order_number, s.name, o.total, o.status::text, o.created_at,
-		       COALESCE(agg.first_item, ''), COALESCE(agg.item_count, 0), COALESCE(agg.qty, 0)
+		       COALESCE(agg.first_item, ''), COALESCE(agg.item_count, 0), COALESCE(agg.qty, 0),
+		       o.status = 'COMPLETED' AND NOT EXISTS (SELECT 1 FROM order_ratings r WHERE r.order_id = o.id)
 		FROM orders o
 		JOIN stores s ON s.id = o.store_id
 		LEFT JOIN LATERAL (
@@ -279,16 +320,16 @@ func (Repository) List(ctx context.Context, db database.DBTX, userID string, sta
 			       count(*)::int AS item_count, sum(quantity)::int AS qty
 			FROM order_items WHERE order_id = o.id
 		) agg ON true
-		WHERE o.user_id = $1 AND (cardinality($2::text[]) = 0 OR o.status::text = ANY($2))
-		ORDER BY o.created_at DESC, o.order_number DESC
-		LIMIT $3 OFFSET $4`, userID, statuses, limit, offset)
+		WHERE `+where+`
+		ORDER BY o.created_at `+dir+`, o.order_number `+dir+`
+		LIMIT $5 OFFSET $6`, userID, f.Statuses, f.From, f.To, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
 	list, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Summary, error) {
 		var s Summary
 		err := row.Scan(&s.ID, &s.OrderNumber, &s.StoreName, &s.Total, &s.Status, &s.CreatedAt,
-			&s.FirstItem, &s.ItemCount, &s.Qty)
+			&s.FirstItem, &s.ItemCount, &s.Qty, &s.CanRate)
 		return s, err
 	})
 	return list, total, err
@@ -342,13 +383,16 @@ func (Repository) Get(ctx context.Context, db database.DBTX, id, userID string) 
 		return o, err
 	}
 
-	rows, err = db.Query(ctx, `SELECT status::text, at FROM order_status_history WHERE order_id = $1 ORDER BY at, status`, o.ID)
+	rows, err = db.Query(ctx, `
+		SELECT h.status::text, h.at, h.note, u.name
+		FROM order_status_history h LEFT JOIN users u ON u.id = h.changed_by
+		WHERE h.order_id = $1 ORDER BY h.at, h.status`, o.ID)
 	if err != nil {
 		return o, err
 	}
 	o.History, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (StatusEvent, error) {
 		var e StatusEvent
-		err := row.Scan(&e.Status, &e.At)
+		err := row.Scan(&e.Status, &e.At, &e.Note, &e.ChangedBy)
 		return e, err
 	})
 	if err != nil {

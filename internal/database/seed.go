@@ -13,6 +13,7 @@ import (
 // DemoUser: akun demo yang sama dengan AuthMockDataSource di iOS.
 type DemoUser struct {
 	Email, Password, Name, Phone, Tier string
+	Role                               string // "" = CUSTOMER
 	Points                             int
 	Balance                            int64
 	Vouchers                           []string
@@ -25,6 +26,9 @@ type DemoAddress struct {
 }
 
 var DemoUsers = []DemoUser{
+	// Akun web admin (trytuistadmin). Hanya untuk dev/staging; di prod promosikan
+	// user lewat SQL: UPDATE users SET role = 'ADMIN' WHERE lower(email) = '...';
+	{Email: "admin@trytuist.com", Password: "admin12345", Name: "Admin TryTuist", Tier: "SILVER", Role: "ADMIN"},
 	{
 		Email: "kholis@gmail.com", Password: "12345678", Name: "Kholis", Phone: "081234567890",
 		Tier: "GOLD", Points: 1250, Balance: 50000,
@@ -72,12 +76,16 @@ func seedUser(ctx context.Context, tx pgx.Tx, u DemoUser, cost int) error {
 	if err != nil {
 		return err
 	}
+	role := u.Role
+	if role == "" {
+		role = "CUSTOMER"
+	}
 	var id string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance)
-		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7)
-		ON CONFLICT (lower(email)) DO UPDATE SET password_hash = EXCLUDED.password_hash, updated_at = now()
-		RETURNING id::text`, u.Name, u.Email, string(hash), u.Phone, u.Tier, u.Points, u.Balance).Scan(&id)
+		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance, role)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8)
+		ON CONFLICT (lower(email)) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, updated_at = now()
+		RETURNING id::text`, u.Name, u.Email, string(hash), u.Phone, u.Tier, u.Points, u.Balance, role).Scan(&id)
 	if err != nil {
 		return err
 	}

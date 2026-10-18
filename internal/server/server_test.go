@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -39,9 +40,10 @@ type env struct {
 	t    *testing.T
 	srv  *httptest.Server
 	pool *pgxpool.Pool
+	app  *server.App
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, opts ...server.Option) *env {
 	t.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -62,9 +64,10 @@ func setup(t *testing.T) *env {
 		DeliveryFee: 10000, LoginRateLimit: 100,
 		GoogleClientIDs: []string{googleClientID}, GoogleJWKSURL: googleJWKS(t),
 	}
-	srv := httptest.NewServer(server.NewRouter(cfg, pool))
+	app := server.NewApp(cfg, pool, opts...)
+	srv := httptest.NewServer(app.Handler)
 	t.Cleanup(srv.Close)
-	return &env{t: t, srv: srv, pool: pool}
+	return &env{t: t, srv: srv, pool: pool, app: app}
 }
 
 func resetDB(t *testing.T, pool *pgxpool.Pool) {
@@ -280,8 +283,35 @@ func TestOrderFlow(t *testing.T) {
 	for _, s := range []string{"PAID", "PROCESSING", "DELIVERING", "COMPLETED"} {
 		expect(t, e.do("POST", "/v1/dev/orders/"+id2+"/status", token, map[string]any{"status": s}), 200, "")
 	}
+	// Filter waktu, urutan, can_rate
+	canRate := func() map[string]bool {
+		m := map[string]bool{}
+		for _, o := range e.do("GET", "/v1/orders", token, nil).list() {
+			m[o.(map[string]any)["order_id"].(string)] = o.(map[string]any)["can_rate"].(bool)
+		}
+		return m
+	}
+	if m := canRate(); !m[id2] || m[orderID] {
+		t.Fatalf("can_rate salah sebelum dinilai: %v", m)
+	}
+	if asc := e.do("GET", "/v1/orders?sort=asc", token, nil).list(); len(asc) != 2 || asc[0].(map[string]any)["order_id"] != orderID {
+		t.Fatalf("sort=asc harus pesanan terlama dulu: %v", asc)
+	}
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	if l := e.do("GET", "/v1/orders?from="+future, token, nil).list(); len(l) != 0 {
+		t.Fatalf("from di masa depan harus kosong, dapat %d", len(l))
+	}
+	if l := e.do("GET", "/v1/orders?to="+future+"&status=COMPLETED", token, nil).list(); len(l) != 1 {
+		t.Fatalf("to + status harus 1 pesanan, dapat %d", len(l))
+	}
+	expect(t, e.do("GET", "/v1/orders?from=kemarin", token, nil), 400, "VALIDATION_ERROR")
+	expect(t, e.do("GET", "/v1/orders?sort=new", token, nil), 400, "VALIDATION_ERROR")
+
 	expect(t, e.do("POST", "/v1/orders/"+id2+"/rating", token, map[string]any{"rating": 4, "comment": "Enak"}), 200, "")
 	expect(t, e.do("POST", "/v1/orders/"+id2+"/rating", token, map[string]any{"rating": 4}), 409, "ALREADY_RATED")
+	if canRate()[id2] {
+		t.Fatal("can_rate harus false setelah dinilai")
+	}
 	if rating := e.do("GET", "/v1/products/P14", "", nil).data()["rating"].(float64); rating != 4 {
 		t.Fatalf("rating produk = %v, harap 4", rating)
 	}
@@ -404,7 +434,9 @@ func TestHomeConfigPromo(t *testing.T) {
 	// Metode bayar yang dimatikan di app_config ditolak (sejak migrasi 0003 e-wallet aktif,
 	// jadi dimatikan dulu khusus untuk test ini).
 	if _, err := e.pool.Exec(context.Background(), `UPDATE app_config
-		SET value = jsonb_set(value, '{2,is_enabled}', 'false') WHERE key = 'payment_methods'`); err != nil {
+		SET value = (SELECT jsonb_agg(CASE WHEN m->>'id' = 'EWALLET' THEN jsonb_set(m, '{is_enabled}', 'false') ELSE m END)
+		             FROM jsonb_array_elements(value) m)
+		WHERE key = 'payment_methods'`); err != nil {
 		t.Fatal(err)
 	}
 	expect(t, e.do("POST", "/v1/orders", token, map[string]any{"payment_method": "EWALLET",
@@ -711,4 +743,383 @@ func TestGoogleSignInDisabled(t *testing.T) {
 	t.Cleanup(srv.Close)
 	e := &env{t: t, srv: srv, pool: pool}
 	expect(t, e.do("POST", "/v1/auth/google", "", map[string]any{"id_token": "x.y.z"}), 503, "GOOGLE_SIGN_IN_DISABLED")
+}
+
+func TestProductDeals(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+
+	// Harga promo tampil di detail & list; harga normal di original_price.
+	p := e.do("GET", "/v1/products/P07", "", nil).data()
+	if p["price"].(float64) != 19900 || p["original_price"].(float64) != 32000 || p["discount_percent"].(float64) != 37 {
+		t.Fatalf("harga promo P07 salah: %v", p)
+	}
+	if tags := fmt.Sprint(p["tags"]); !strings.Contains(tags, "promo") {
+		t.Fatalf("tag promo tidak ada: %v", tags)
+	}
+	if p := e.do("GET", "/v1/products/P01", "", nil).data(); p["original_price"] != nil || p["discount_percent"].(float64) != 0 {
+		t.Fatalf("P01 tidak sedang promo: %v", p)
+	}
+	cheapest := e.do("GET", "/v1/products?sort=price_asc&limit=1", "", nil).list()[0].(map[string]any)
+	if cheapest["product_id"] != "P12" || cheapest["price"].(float64) != 12000 {
+		t.Fatalf("sort harga harus pakai harga promo: %v", cheapest)
+	}
+
+	// Popup Beranda
+	pop := e.do("GET", "/v1/promotions/popup", "", nil)
+	expect(t, pop, 200, "")
+	d := pop.data()
+	prod, _ := d["product"].(map[string]any)
+	if d["id"] != "D01" || d["badge"] != "HEMAT 37%" || prod["product_id"] != "P07" || d["image_url"] != prod["image_url"] || d["ends_at"] == "" {
+		t.Fatalf("popup salah: %v", d)
+	}
+
+	// Quote & checkout memakai harga promo.
+	token, _ := e.login("kholis@gmail.com", "12345678")
+	q := e.do("POST", "/v1/orders/quote", token, map[string]any{"items": []map[string]any{{"product_id": "P07", "quantity": 2}}})
+	expect(t, q, 200, "")
+	if got := q.data()["subtotal"].(float64); got != 39800 {
+		t.Fatalf("subtotal = %v, harap 39800 (2 × 19.900)", got)
+	}
+
+	// Produk habis → popup dilewati; deal lewat → harga normal & popup kosong.
+	if _, err := e.pool.Exec(ctx, `UPDATE products SET is_available = FALSE WHERE id = 'P07'`); err != nil {
+		t.Fatal(err)
+	}
+	if pop := e.do("GET", "/v1/promotions/popup", "", nil); pop.Body["data"] != nil {
+		t.Fatalf("popup produk habis harus null: %v", pop.Body)
+	}
+	for _, sql := range []string{
+		`UPDATE products SET is_available = TRUE WHERE id = 'P07'`,
+		`UPDATE product_deals SET starts_at = now() - interval '2 days', ends_at = now() - interval '1 day' WHERE id = 'D01'`,
+	} {
+		if _, err := e.pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pop := e.do("GET", "/v1/promotions/popup", "", nil); pop.Body["data"] != nil {
+		t.Fatalf("popup deal kedaluwarsa harus null: %v", pop.Body)
+	}
+	if p := e.do("GET", "/v1/products/P07", "", nil).data(); p["price"].(float64) != 32000 || p["original_price"] != nil {
+		t.Fatalf("setelah promo berakhir harga harus normal: %v", p)
+	}
+}
+
+func TestAdmin(t *testing.T) {
+	e := setup(t)
+
+	customer, _ := e.login("kholis@gmail.com", "12345678")
+	expect(t, e.do("GET", "/v1/admin/me", "", nil), 401, "UNAUTHORIZED")
+	expect(t, e.do("GET", "/v1/admin/me", customer, nil), 403, "FORBIDDEN")
+
+	adminTok, _ := e.login("admin@trytuist.com", "admin12345")
+	me := e.do("GET", "/v1/admin/me", adminTok, nil)
+	expect(t, me, 200, "")
+	if me.data()["role"] != "ADMIN" || me.data()["email"] != "admin@trytuist.com" {
+		t.Fatalf("admin/me salah: %v", me.data())
+	}
+
+	// Dua pesanan dari pelanggan.
+	o1 := e.do("POST", "/v1/orders", customer, map[string]any{"payment_method": "COD",
+		"items": []map[string]any{{"product_id": "P01", "quantity": 2}}})
+	expect(t, o1, 201, "")
+	o2 := e.do("POST", "/v1/orders", customer, map[string]any{"payment_method": "QRIS",
+		"items": []map[string]any{{"product_id": "P14", "quantity": 1}}})
+	expect(t, o2, 201, "")
+	id1, id2 := o1.data()["order_id"].(string), o2.data()["order_id"].(string)
+
+	list := e.do("GET", "/v1/admin/orders?status=PENDING&q=kholis", adminTok, nil)
+	expect(t, list, 200, "")
+	if n := len(list.list()); n != 2 || list.Body["meta"].(map[string]any)["total"].(float64) != 2 {
+		t.Fatalf("daftar pesanan admin = %d: %v", n, list.Body)
+	}
+	if c := list.list()[0].(map[string]any)["customer"].(map[string]any); c["email"] != "kholis@gmail.com" {
+		t.Fatalf("customer salah: %v", c)
+	}
+	expect(t, e.do("GET", "/v1/admin/orders?status=DONE", adminTok, nil), 400, "VALIDATION_ERROR")
+	if n := len(e.do("GET", "/v1/admin/orders?q=tidak-ada", adminTok, nil).list()); n != 0 {
+		t.Fatalf("pencarian harus kosong, dapat %d", n)
+	}
+
+	detail := e.do("GET", "/v1/admin/orders/"+id1, adminTok, nil).data()
+	if next := fmt.Sprint(detail["next_statuses"]); !strings.Contains(next, "COMPLETED") || !strings.Contains(next, "FAILED") {
+		t.Fatalf("next_statuses = %v", next)
+	}
+
+	// Gagal: alasan wajib; status akhir terkunci; pelanggan melihat alasannya.
+	expect(t, e.do("PATCH", "/v1/admin/orders/"+id1+"/status", adminTok, map[string]any{"status": "FAILED"}), 400, "VALIDATION_ERROR")
+	failed := e.do("PATCH", "/v1/admin/orders/"+id1+"/status", adminTok, map[string]any{"status": "FAILED", "note": "Stok habis"})
+	expect(t, failed, 200, "")
+	hist := failed.data()["status_history"].([]any)
+	last := hist[len(hist)-1].(map[string]any)
+	if last["status"] != "FAILED" || last["note"] != "Stok habis" || last["changed_by"] != "Admin TryTuist" {
+		t.Fatalf("riwayat status salah: %v", last)
+	}
+	expect(t, e.do("PATCH", "/v1/admin/orders/"+id1+"/status", adminTok, map[string]any{"status": "COMPLETED"}), 422, "INVALID_STATUS_TRANSITION")
+	mine := e.do("GET", "/v1/orders/"+id1, customer, nil).data()
+	if mine["status"] != "FAILED" {
+		t.Fatalf("pelanggan harus melihat FAILED: %v", mine["status"])
+	}
+
+	// Sukses langsung dari PENDING.
+	expect(t, e.do("PATCH", "/v1/admin/orders/"+id2+"/status", adminTok, map[string]any{"status": "COMPLETED"}), 200, "")
+	expect(t, e.do("PATCH", "/v1/admin/orders/"+id2+"/status", customer, map[string]any{"status": "FAILED", "note": "x"}), 403, "FORBIDDEN")
+
+	// Dashboard
+	dash := e.do("GET", "/v1/admin/dashboard", adminTok, nil)
+	expect(t, dash, 200, "")
+	d := dash.data()
+	sales, purchases := d["sales"].(map[string]any), d["purchases"].(map[string]any)
+	if sales["revenue"].(float64) != o2.data()["total"].(float64) || sales["orders_completed"].(float64) != 1 || sales["items_sold"].(float64) != 1 {
+		t.Fatalf("penjualan salah: %v", sales)
+	}
+	if purchases["orders"].(float64) != 2 || purchases["failed"].(float64) != 1 || purchases["buyers"].(float64) != 1 ||
+		purchases["new_buyers"].(float64) != 1 || purchases["success_rate_pct"].(float64) != 50 {
+		t.Fatalf("pembelian salah: %v", purchases)
+	}
+	if n := len(d["daily"].([]any)); n != 30 {
+		t.Fatalf("daily = %d hari, harap 30", n)
+	}
+	if top := d["top_products"].([]any); len(top) != 1 || top[0].(map[string]any)["product_id"] != "P14" {
+		t.Fatalf("top produk salah: %v", top)
+	}
+	expect(t, e.do("GET", "/v1/admin/dashboard?from=2026-05-01&to=2026-04-01", adminTok, nil), 400, "VALIDATION_ERROR")
+
+	// Ubah harga & stok
+	expect(t, e.do("PATCH", "/v1/admin/products/P01", adminTok, map[string]any{"price": -1}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("PATCH", "/v1/admin/products/P01", adminTok, map[string]any{}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("PATCH", "/v1/admin/products/P99", adminTok, map[string]any{"price": 1000}), 404, "NOT_FOUND")
+	up := e.do("PATCH", "/v1/admin/products/P01", adminTok, map[string]any{"price": 23000})
+	expect(t, up, 200, "")
+	if p := e.do("GET", "/v1/products/P01", "", nil).data(); p["price"].(float64) != 23000 {
+		t.Fatalf("harga publik belum berubah: %v", p["price"])
+	}
+	expect(t, e.do("PATCH", "/v1/admin/products/P01", adminTok, map[string]any{"is_available": false}), 200, "")
+	if p := e.do("GET", "/v1/products/P01", "", nil).data(); p["is_available"] != false {
+		t.Fatal("P01 harus habis")
+	}
+	if n := len(e.do("GET", "/v1/admin/products?available=false", adminTok, nil).list()); n != 2 { // P01 + P06
+		t.Fatalf("produk habis = %d, harap 2", n)
+	}
+
+	// Tambah menu
+	expect(t, e.do("POST", "/v1/admin/products", adminTok, map[string]any{"product_name": "Es Teh"}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("POST", "/v1/admin/products", adminTok, map[string]any{"category_id": "nope", "product_name": "Es Teh", "price": 8000}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("POST", "/v1/admin/products", adminTok, map[string]any{"category_id": "non_coffee", "product_name": "Es Teh", "price": 8000,
+		"options": []map[string]any{{"name": "Regular"}, {"name": "regular"}}}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("POST", "/v1/admin/products", adminTok, map[string]any{"category_id": "non_coffee", "product_name": "Es Teh", "price": 8000,
+		"image_url": "http://x.com/a.jpg"}), 400, "VALIDATION_ERROR")
+	menu := e.do("POST", "/v1/admin/products", adminTok, map[string]any{
+		"category_id": "non_coffee", "product_name": "  Es Teh Manis ", "description": "Teh melati dingin.", "price": 8000,
+		"image_url": "https://images.unsplash.com/photo-1556679343-c7306c1976bc?w=800",
+		"options":   []map[string]any{{"name": "Regular"}, {"name": "Porsi Jumbo", "extra_price": 3000}},
+	})
+	expect(t, menu, 201, "")
+	newID := menu.data()["product_id"].(string)
+	if newID != "P15" || menu.data()["product_name"] != "Es Teh Manis" || len(menu.data()["options"].([]any)) != 2 {
+		t.Fatalf("menu baru salah: %v", menu.data())
+	}
+	if opt := menu.data()["options"].([]any)[1].(map[string]any); opt["id"] != "porsi-jumbo" || opt["extra_price"].(float64) != 3000 {
+		t.Fatalf("varian salah: %v", opt)
+	}
+	pub := e.do("GET", "/v1/products/"+newID, "", nil)
+	expect(t, pub, 200, "")
+	if pub.data()["price"].(float64) != 8000 || pub.data()["category_id"] != "non_coffee" {
+		t.Fatalf("menu baru belum tampil di app: %v", pub.data())
+	}
+	if n := len(e.do("GET", "/v1/products?limit=100", "", nil).list()); n != 15 {
+		t.Fatalf("produk = %d, harap 15", n)
+	}
+	// Bisa langsung dipesan pelanggan (varian baru ikut dihitung).
+	q := e.do("POST", "/v1/orders/quote", customer, map[string]any{"items": []map[string]any{{"product_id": newID, "option_id": "porsi-jumbo", "quantity": 2}}})
+	expect(t, q, 200, "")
+	if q.data()["subtotal"].(float64) != 22000 {
+		t.Fatalf("subtotal menu baru = %v, harap 22000", q.data()["subtotal"])
+	}
+	// Ubah varian & foto; kirim [] = hapus semua varian.
+	edited := e.do("PATCH", "/v1/admin/products/"+newID, adminTok, map[string]any{"options": []map[string]any{}, "image_url": ""})
+	expect(t, edited, 200, "")
+	if len(edited.data()["options"].([]any)) != 0 || edited.data()["image_url"] != "" {
+		t.Fatalf("edit varian/foto gagal: %v", edited.data())
+	}
+	if second := e.do("POST", "/v1/admin/products", adminTok, map[string]any{"category_id": "snack", "product_name": "Pisang Goreng", "price": 12000}); second.data()["product_id"] != "P16" {
+		t.Fatalf("id menu kedua = %v", second.data()["product_id"])
+	}
+
+	// Promo
+	expect(t, e.do("POST", "/v1/admin/deals", adminTok, map[string]any{"product_id": "P01", "title": "Kopi murah",
+		"deal_price": 30000, "ends_at": time.Now().Add(48 * time.Hour)}), 422, "DEAL_PRICE_TOO_HIGH")
+	expect(t, e.do("POST", "/v1/admin/deals", adminTok, map[string]any{"product_id": "P01"}), 400, "VALIDATION_ERROR")
+	created := e.do("POST", "/v1/admin/deals", adminTok, map[string]any{"product_id": "P01", "title": "Kopi murah",
+		"deal_price": 15000, "ends_at": time.Now().Add(48 * time.Hour)})
+	expect(t, created, 201, "")
+	dealID := created.data()["id"].(string)
+	if created.data()["status"] != "ACTIVE" || created.data()["discount_percent"].(float64) != 34 {
+		t.Fatalf("promo baru salah: %v", created.data())
+	}
+	if p := e.do("GET", "/v1/products/P01", "", nil).data(); p["price"].(float64) != 15000 || p["original_price"].(float64) != 23000 {
+		t.Fatalf("harga promo belum berlaku: %v", p)
+	}
+	off := e.do("PATCH", "/v1/admin/deals/"+dealID, adminTok, map[string]any{"is_active": false})
+	expect(t, off, 200, "")
+	if off.data()["status"] != "INACTIVE" {
+		t.Fatalf("status promo = %v", off.data()["status"])
+	}
+	if p := e.do("GET", "/v1/products/P01", "", nil).data(); p["price"].(float64) != 23000 {
+		t.Fatalf("promo nonaktif harus kembali ke harga normal: %v", p["price"])
+	}
+	expect(t, e.do("DELETE", "/v1/admin/deals/"+dealID, adminTok, nil), 200, "")
+	expect(t, e.do("DELETE", "/v1/admin/deals/"+dealID, adminTok, nil), 404, "NOT_FOUND")
+	if n := len(e.do("GET", "/v1/admin/deals", adminTok, nil).list()); n != 3 { // seed D01–D03
+		t.Fatalf("promo = %d, harap 3", n)
+	}
+
+	cust := e.do("GET", "/v1/admin/customers?q=kholis", adminTok, nil)
+	expect(t, cust, 200, "")
+	if c := cust.list(); len(c) != 1 || c[0].(map[string]any)["orders_count"].(float64) != 2 ||
+		c[0].(map[string]any)["total_spent"].(float64) != o2.data()["total"].(float64) {
+		t.Fatalf("pelanggan salah: %v", c)
+	}
+
+	logs := e.do("GET", "/v1/admin/audit-logs?limit=50", adminTok, nil)
+	expect(t, logs, 200, "")
+	actions := fmt.Sprint(logs.list())
+	for _, a := range []string{"ORDER_STATUS", "PRODUCT_CREATE", "PRODUCT_UPDATE", "DEAL_CREATE", "DEAL_UPDATE", "DEAL_DELETE"} {
+		if !strings.Contains(actions, a) {
+			t.Fatalf("audit log tidak memuat %s", a)
+		}
+	}
+}
+
+func TestMultiOutlet(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := e.pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	find := func(list []any, id string) map[string]any {
+		t.Helper()
+		for _, x := range list {
+			if m := x.(map[string]any); m["id"] == id || m["product_id"] == id || m["store_id"] == id {
+				return m
+			}
+		}
+		t.Fatalf("%s tidak ada di %v", id, list)
+		return nil
+	}
+
+	// Daftar outlet dari lokasi Kebayoran Lama: Gandaria terdekat, Kelapa Gading di luar jangkauan.
+	stores := e.do("GET", "/v1/stores?lat=-6.2420&lng=106.7830", "", nil).list()
+	if len(stores) != 3 || stores[0].(map[string]any)["id"] != "ST01" {
+		t.Fatalf("urutan outlet salah: %v", stores)
+	}
+	st01, st03 := find(stores, "ST01"), find(stores, "ST03")
+	if st01["hours_label"] != "24 jam" || st01["is_deliverable"] != true || st03["is_deliverable"] != false {
+		t.Fatalf("status outlet salah: %v | %v", st01, st03)
+	}
+
+	// Stok per outlet: Ramen habis di Kemang saja; harga sama.
+	if p := e.do("GET", "/v1/products/P09?store_id=ST02", "", nil).data(); p["is_available"] != false {
+		t.Fatalf("P09 harus habis di ST02: %v", p)
+	}
+	p01, p02 := e.do("GET", "/v1/products/P09", "", nil).data(), e.do("GET", "/v1/products/P09?store_id=ST01", "", nil).data()
+	if p01["is_available"] != true || p02["is_available"] != true || p01["price"] != p02["price"] {
+		t.Fatal("P09 tersedia di ST01 dengan harga yang sama")
+	}
+	if p := find(e.do("GET", "/v1/products?limit=100&store_id=ST02", "", nil).list(), "P09"); p["is_available"] != false {
+		t.Fatal("list produk ST02 harus menandai P09 habis")
+	}
+	expect(t, e.do("GET", "/v1/products?store_id=NOPE", "", nil), 400, "VALIDATION_ERROR")
+	home := e.do("GET", "/v1/home?store_id=ST02", "", nil).data()
+	if home["store"].(map[string]any)["id"] != "ST02" || strings.Contains(fmt.Sprint(home["sections"]), "Ramen Pedas") {
+		t.Fatalf("Beranda ST02 tidak boleh menampilkan menu yang habis: %v", home["store"])
+	}
+
+	// Checkout mengikuti outlet.
+	token, _ := e.login("kholis@gmail.com", "12345678")
+	addrs := e.do("GET", "/v1/me/addresses", token, nil).list()
+	addrID := addrs[0].(map[string]any)["id"].(string)
+	item := func(id string) []map[string]any { return []map[string]any{{"product_id": id, "quantity": 1}} }
+
+	q := e.do("POST", "/v1/orders/quote", token, map[string]any{"address_id": addrID, "items": item("P09")})
+	expect(t, q, 200, "")
+	if q.data()["store_id"] != "ST01" || q.data()["store_name"] != "Gandaria City" {
+		t.Fatalf("outlet otomatis harus Gandaria: %v", q.data())
+	}
+	bad := e.do("POST", "/v1/orders/quote", token, map[string]any{"store_id": "ST02", "address_id": addrID, "items": item("P09")})
+	expect(t, bad, 422, "PRODUCT_UNAVAILABLE")
+	if !strings.Contains(bad.Body["message"].(string), "Kemang Utara") {
+		t.Fatalf("pesan harus menyebut outlet: %v", bad.Body["message"])
+	}
+	exec(`UPDATE stores SET opens_at = '00:00', closes_at = '00:00' WHERE id = 'ST03'`)
+	expect(t, e.do("POST", "/v1/orders/quote", token, map[string]any{"store_id": "ST03", "address_id": addrID, "items": item("P01")}),
+		422, "OUT_OF_DELIVERY_AREA")
+	// Tanpa alamat (ambil sendiri) jangkauan tidak dicek.
+	expect(t, e.do("POST", "/v1/orders/quote", token, map[string]any{"store_id": "ST03", "items": item("P01")}), 200, "")
+	exec(`UPDATE stores SET opens_at = (now() AT TIME ZONE 'Asia/Jakarta' + interval '1 hour')::time,
+		closes_at = (now() AT TIME ZONE 'Asia/Jakarta' + interval '2 hours')::time WHERE id = 'ST03'`)
+	expect(t, e.do("POST", "/v1/orders/quote", token, map[string]any{"store_id": "ST03", "items": item("P01")}), 422, "STORE_CLOSED")
+
+	// Admin: tutup sementara → otomatis pindah ke outlet terdekat berikutnya.
+	adminTok, _ := e.login("admin@trytuist.com", "admin12345")
+	closed := e.do("PATCH", "/v1/admin/stores/ST01", adminTok, map[string]any{"is_temporarily_closed": true})
+	expect(t, closed, 200, "")
+	if closed.data()["is_open_now"] != false {
+		t.Fatalf("ST01 harus tutup: %v", closed.data())
+	}
+	if s := find(e.do("GET", "/v1/stores?lat=-6.2420&lng=106.7830", "", nil).list(), "ST01"); s["is_open"] != false || s["closed_note"] == nil {
+		t.Fatalf("ST01 harus terlihat tutup: %v", s)
+	}
+	expect(t, e.do("POST", "/v1/orders/quote", token, map[string]any{"store_id": "ST01", "items": item("P01")}), 422, "STORE_CLOSED")
+	if q := e.do("POST", "/v1/orders/quote", token, map[string]any{"address_id": addrID, "items": item("P01")}); q.data()["store_id"] != "ST02" {
+		t.Fatalf("saat Gandaria tutup harus pindah ke Kemang: %v", q.Body)
+	}
+	expect(t, e.do("PATCH", "/v1/admin/stores/ST01", adminTok, map[string]any{"is_temporarily_closed": false}), 200, "")
+	expect(t, e.do("PATCH", "/v1/admin/stores/ST01", adminTok, map[string]any{"opens_at": "25:00"}), 400, "VALIDATION_ERROR")
+	expect(t, e.do("PATCH", "/v1/admin/stores/ST99", adminTok, map[string]any{"name": "X"}), 404, "NOT_FOUND")
+
+	// Admin: tambah outlet & atur stoknya.
+	expect(t, e.do("POST", "/v1/admin/stores", adminTok, map[string]any{"name": "Tebet"}), 400, "VALIDATION_ERROR")
+	created := e.do("POST", "/v1/admin/stores", adminTok, map[string]any{
+		"name": "Tebet", "address": "Jl. Tebet Raya No. 5", "lat": -6.2264, "lng": 106.8540,
+		"opens_at": "09:00", "closes_at": "21:00", "delivery_radius_km": 4,
+	})
+	expect(t, created, 201, "")
+	if created.data()["id"] != "ST04" || created.data()["hours_label"] != "09:00–21:00" {
+		t.Fatalf("outlet baru salah: %v", created.data())
+	}
+	expect(t, e.do("PUT", "/v1/admin/stores/ST04/products/P01", adminTok, map[string]any{"is_available": false}), 200, "")
+	if p := find(e.do("GET", "/v1/admin/products?store_id=ST04", adminTok, nil).list(), "P01"); p["store_available"] != false || p["store_sold_out"] != true {
+		t.Fatalf("P01 harus habis di ST04: %v", p)
+	}
+	if p := e.do("GET", "/v1/products/P01?store_id=ST04", "", nil).data(); p["is_available"] != false {
+		t.Fatal("app harus melihat P01 habis di ST04")
+	}
+	expect(t, e.do("PUT", "/v1/admin/stores/ST04/products/P01", adminTok, map[string]any{"is_available": true}), 200, "")
+	if p := e.do("GET", "/v1/products/P01?store_id=ST04", "", nil).data(); p["is_available"] != true {
+		t.Fatal("P01 harus tersedia lagi di ST04")
+	}
+	list := e.do("GET", "/v1/admin/stores", adminTok, nil).list()
+	if len(list) != 4 || find(list, "ST02")["unavailable_products"].(float64) != 1 {
+		t.Fatalf("daftar outlet admin salah: %v", list)
+	}
+
+	// Pesanan & dashboard per outlet.
+	expect(t, e.do("POST", "/v1/orders", token, map[string]any{"store_id": "ST02", "payment_method": "COD", "items": item("P01")}), 201, "")
+	expect(t, e.do("POST", "/v1/orders", token, map[string]any{"store_id": "ST01", "payment_method": "COD", "items": item("P02")}), 201, "")
+	if o := e.do("GET", "/v1/admin/orders?store_id=ST02", adminTok, nil).list(); len(o) != 1 || o[0].(map[string]any)["store_id"] != "ST02" {
+		t.Fatalf("filter pesanan per outlet salah: %v", o)
+	}
+	all := e.do("GET", "/v1/admin/dashboard", adminTok, nil).data()
+	if all["store_id"] != nil || find(all["by_store"].([]any), "ST02")["orders"].(float64) != 1 {
+		t.Fatalf("perbandingan outlet salah: %v", all["by_store"])
+	}
+	one := e.do("GET", "/v1/admin/dashboard?store_id=ST02", adminTok, nil).data()
+	if one["purchases"].(map[string]any)["orders"].(float64) != 1 || len(one["by_store"].([]any)) != 0 {
+		t.Fatalf("dashboard ST02 salah: %v", one["purchases"])
+	}
+	expect(t, e.do("GET", "/v1/admin/dashboard?store_id=NOPE", adminTok, nil), 400, "VALIDATION_ERROR")
 }

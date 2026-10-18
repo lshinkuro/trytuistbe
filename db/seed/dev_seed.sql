@@ -67,11 +67,30 @@ INSERT INTO product_options (product_id, id, name, extra_price, sort_order) VALU
   ('P10', 'jumbo', 'Porsi Jumbo', 8000, 3)
 ON CONFLICT (product_id, id) DO UPDATE SET name = EXCLUDED.name, extra_price = EXCLUDED.extra_price, sort_order = EXCLUDED.sort_order;
 
+-- Promo harga produk (§5.24). D01 tampil sebagai popup di Beranda; image_url NULL = foto produk.
+INSERT INTO product_deals (id, product_id, title, subtitle, badge, image_url, deal_price, starts_at, ends_at, show_as_popup, sort_order) VALUES
+  ('D01', 'P07', 'Nasi Goreng Spesial cuma 19rb!', 'Promo makan hemat minggu ini. Selama persediaan ada.', '', NULL, 19900, now() - interval '1 day', now() + interval '30 days', TRUE, 1),
+  ('D02', 'P05', 'Iced Matcha Latte Hemat', 'Segarnya matcha premium, harga lebih ringan.', '', NULL, 17900, now() - interval '1 day', now() + interval '30 days', FALSE, 2),
+  ('D03', 'P12', 'Kentang Goreng 12rb', 'Teman ngopi paling pas.', '', NULL, 12000, now() - interval '1 day', now() + interval '30 days', FALSE, 3)
+ON CONFLICT (id) DO UPDATE SET product_id = EXCLUDED.product_id, title = EXCLUDED.title, subtitle = EXCLUDED.subtitle,
+  badge = EXCLUDED.badge, image_url = EXCLUDED.image_url, deal_price = EXCLUDED.deal_price, starts_at = EXCLUDED.starts_at,
+  ends_at = EXCLUDED.ends_at, show_as_popup = EXCLUDED.show_as_popup, sort_order = EXCLUDED.sort_order, is_active = TRUE;
+
 -- Outlet
-INSERT INTO stores (id, name, address, lat, lng) VALUES
-  ('ST01', 'Gandaria City', 'Jl. Sultan Iskandar Muda, Jakarta Selatan', -6.2443, 106.7834),
-  ('ST02', 'Kemang Utara', 'Jl. Kemang Utara Raya, Jakarta Selatan', -6.2608, 106.8133)
-ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address, lat = EXCLUDED.lat, lng = EXCLUDED.lng;
+-- Outlet (§5.26). ST01 & ST02 buka 24 jam (00:00–00:00) supaya contoh & test bisa dipakai kapan saja.
+INSERT INTO stores (id, name, address, lat, lng, phone, opens_at, closes_at, delivery_radius_km, sort_order) VALUES
+  ('ST01', 'Gandaria City', 'Jl. Sultan Iskandar Muda, Jakarta Selatan', -6.2443, 106.7834, '021-2900-1001', '00:00', '00:00', 7, 1),
+  ('ST02', 'Kemang Utara', 'Jl. Kemang Utara Raya, Jakarta Selatan', -6.2608, 106.8133, '021-2900-1002', '00:00', '00:00', 5, 2),
+  ('ST03', 'Kelapa Gading', 'Jl. Boulevard Raya, Kelapa Gading, Jakarta Utara', -6.1588, 106.9057, '021-2900-1003', '10:00', '22:00', 6, 3)
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address, lat = EXCLUDED.lat, lng = EXCLUDED.lng,
+  phone = EXCLUDED.phone, opens_at = EXCLUDED.opens_at, closes_at = EXCLUDED.closes_at,
+  delivery_radius_km = EXCLUDED.delivery_radius_km, sort_order = EXCLUDED.sort_order;
+
+-- Stok per outlet: Ramen Pedas habis di Kemang, Chocolate Cake habis di Kelapa Gading.
+INSERT INTO store_product_availability (store_id, product_id, is_available) VALUES
+  ('ST02', 'P09', FALSE),
+  ('ST03', 'P14', FALSE)
+ON CONFLICT (store_id, product_id) DO UPDATE SET is_available = EXCLUDED.is_available;
 
 -- Voucher
 INSERT INTO vouchers (code, title, description, discount_type, discount_value, min_subtotal, max_discount, starts_at, ends_at) VALUES

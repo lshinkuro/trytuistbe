@@ -27,6 +27,17 @@ type Config struct {
 	// Google Sign-In: OAuth client ID iOS (boleh lebih dari satu: Dev/Staging/Prod). Kosong = nonaktif.
 	GoogleClientIDs []string
 	GoogleJWKSURL   string
+	// Pembayaran online Midtrans (§5.27). Server key kosong = Bayar Online nonaktif.
+	MidtransServerKey       string
+	MidtransIsProduction    bool
+	MidtransEnabledPayments []string
+	PublicBaseURL           string // untuk finish URL Snap
+	PaymentExpiry           time.Duration
+	CODDisabled             bool // COD_ENABLED=false
+	// Push iOS lewat APNs (§5.28). Kosong = notifikasi hanya dicatat di log.
+	APNsKeyID   string
+	APNsTeamID  string
+	APNsKeyFile string // path file AuthKey_XXXX.p8
 }
 
 func (c Config) IsDev() bool  { return c.Env == "dev" }
@@ -97,6 +108,29 @@ func Load() (Config, error) {
 		}
 	}
 	cfg.GoogleJWKSURL = get("GOOGLE_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs")
+
+	cfg.MidtransServerKey = get("MIDTRANS_SERVER_KEY", "")
+	cfg.MidtransIsProduction = strings.EqualFold(get("MIDTRANS_IS_PRODUCTION", "false"), "true")
+	if cfg.MidtransIsProduction && strings.HasPrefix(cfg.MidtransServerKey, "SB-") {
+		return cfg, fmt.Errorf("MIDTRANS_IS_PRODUCTION=true tapi MIDTRANS_SERVER_KEY adalah key sandbox (SB-…)")
+	}
+	for _, p := range strings.Split(get("MIDTRANS_ENABLED_PAYMENTS", ""), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			cfg.MidtransEnabledPayments = append(cfg.MidtransEnabledPayments, p)
+		}
+	}
+	cfg.PublicBaseURL = strings.TrimRight(get("PUBLIC_BASE_URL", "http://localhost:"+cfg.Port), "/")
+	if cfg.PaymentExpiry, err = time.ParseDuration(get("PAYMENT_EXPIRY", "15m")); err != nil || cfg.PaymentExpiry < time.Minute {
+		return cfg, fmt.Errorf("PAYMENT_EXPIRY harus durasi ≥ 1m (mis. 15m)")
+	}
+	cfg.CODDisabled = strings.EqualFold(get("COD_ENABLED", "true"), "false")
+
+	cfg.APNsKeyID = get("APNS_KEY_ID", "")
+	cfg.APNsTeamID = get("APNS_TEAM_ID", "")
+	cfg.APNsKeyFile = get("APNS_KEY_FILE", "")
+	if cfg.APNsKeyFile != "" && (cfg.APNsKeyID == "" || cfg.APNsTeamID == "") {
+		return cfg, fmt.Errorf("APNS_KEY_FILE diisi tapi APNS_KEY_ID / APNS_TEAM_ID kosong")
+	}
 	return cfg, nil
 }
 
