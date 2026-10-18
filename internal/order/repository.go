@@ -96,6 +96,7 @@ type Summary struct {
 	Status      string
 	CreatedAt   time.Time
 	CanRate     bool
+	Rating      *int // nil = belum dinilai
 }
 
 // ListFilter: filter riwayat pesanan user. From/To nil = tanpa batas; rentang [From, To).
@@ -312,8 +313,9 @@ func (Repository) List(ctx context.Context, db database.DBTX, userID string, f L
 	rows, err := db.Query(ctx, `
 		SELECT o.id::text, o.order_number, s.name, o.total, o.status::text, o.created_at,
 		       COALESCE(agg.first_item, ''), COALESCE(agg.item_count, 0), COALESCE(agg.qty, 0),
-		       o.status = 'COMPLETED' AND NOT EXISTS (SELECT 1 FROM order_ratings r WHERE r.order_id = o.id)
+		       o.status = 'COMPLETED' AND r.order_id IS NULL, r.rating
 		FROM orders o
+		LEFT JOIN order_ratings r ON r.order_id = o.id
 		JOIN stores s ON s.id = o.store_id
 		LEFT JOIN LATERAL (
 			SELECT (array_agg(product_name ORDER BY sort_order))[1] AS first_item,
@@ -329,7 +331,7 @@ func (Repository) List(ctx context.Context, db database.DBTX, userID string, f L
 	list, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Summary, error) {
 		var s Summary
 		err := row.Scan(&s.ID, &s.OrderNumber, &s.StoreName, &s.Total, &s.Status, &s.CreatedAt,
-			&s.FirstItem, &s.ItemCount, &s.Qty, &s.CanRate)
+			&s.FirstItem, &s.ItemCount, &s.Qty, &s.CanRate, &s.Rating)
 		return s, err
 	})
 	return list, total, err

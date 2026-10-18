@@ -312,6 +312,11 @@ func TestOrderFlow(t *testing.T) {
 	if canRate()[id2] {
 		t.Fatal("can_rate harus false setelah dinilai")
 	}
+	for _, o := range e.do("GET", "/v1/orders?status=COMPLETED", token, nil).list() {
+		if got := o.(map[string]any)["rating"]; got != float64(4) {
+			t.Fatalf("rating di list = %v, harap 4", got)
+		}
+	}
 	if rating := e.do("GET", "/v1/products/P14", "", nil).data()["rating"].(float64); rating != 4 {
 		t.Fatalf("rating produk = %v, harap 4", rating)
 	}

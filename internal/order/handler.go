@@ -91,6 +91,7 @@ type OrderSummaryDTO struct {
 	Qty         int    `json:"qty"`
 	Status      string `json:"status"`
 	CanRate     bool   `json:"can_rate"`
+	Rating      *int   `json:"rating"` // bintang 1–5 yang sudah diberikan; null = belum
 }
 
 type StoreDTO struct {
@@ -177,7 +178,7 @@ func toSummaryDTO(s Summary) OrderSummaryDTO {
 	}
 	return OrderSummaryDTO{
 		OrderID: s.ID, OrderNumber: s.OrderNumber, StoreName: s.StoreName, ProductName: name,
-		CreatedAt: httpx.ISO(s.CreatedAt), TotalPrice: s.Total, Qty: s.Qty, Status: s.Status, CanRate: s.CanRate,
+		CreatedAt: httpx.ISO(s.CreatedAt), TotalPrice: s.Total, Qty: s.Qty, Status: s.Status, CanRate: s.CanRate, Rating: s.Rating,
 	}
 }
 
