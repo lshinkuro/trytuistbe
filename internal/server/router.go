@@ -32,7 +32,9 @@ const RequestTimeout = 30 * time.Second
 func NewRouter(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 	tokens := token.NewManager(cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 
-	authH := auth.NewHandler(auth.NewService(pool, tokens), httpx.NewRateLimiter(cfg.LoginRateLimit, time.Minute))
+	google := auth.NewGoogleVerifier(cfg.GoogleClientIDs, cfg.GoogleJWKSURL)
+	authH := auth.NewHandler(auth.NewService(pool, tokens, auth.WithGoogle(google)),
+		httpx.NewRateLimiter(cfg.LoginRateLimit, time.Minute))
 	catalogH := catalog.NewHandler(catalog.NewRepository(pool))
 	// order_rules di tabel app_config; nilai env hanya cadangan bila key belum ada.
 	appConfig := appconfig.NewRepository(pool, appconfig.OrderRules{
@@ -61,6 +63,7 @@ func NewRouter(cfg config.Config, pool *pgxpool.Pool) http.Handler {
 		r.Post("/auth/login", authH.Login) // rate limit di handler (per IP + email)
 		r.Post("/auth/register", authH.Register)
 		r.Post("/auth/refresh", authH.Refresh)
+		r.Post("/auth/google", authH.Google) // daftar & masuk dengan Google (rate limit per IP)
 
 		r.Get("/banners", catalogH.Banners)
 		r.Get("/categories", catalogH.Categories)

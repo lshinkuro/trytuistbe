@@ -8,11 +8,18 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +60,7 @@ func setup(t *testing.T) *env {
 		Env: "dev", APIKeys: []string{apiKey}, JWTSecret: "test-secret-test-secret-test-secret",
 		JWTAccessTTL: 15 * time.Minute, JWTRefreshTTL: time.Hour, Timezone: time.FixedZone("WIB", 7*3600),
 		DeliveryFee: 10000, LoginRateLimit: 100,
+		GoogleClientIDs: []string{googleClientID}, GoogleJWKSURL: googleJWKS(t),
 	}
 	srv := httptest.NewServer(server.NewRouter(cfg, pool))
 	t.Cleanup(srv.Close)
@@ -585,4 +593,122 @@ func TestCheckoutDefaults(t *testing.T) {
 	if r.data()["address"] != nil {
 		t.Fatalf("demo tanpa alamat: %v", r.data()["address"])
 	}
+}
+
+// ===== Google Sign-In (kunci & JWKS palsu, tanpa internet) =====
+
+const googleClientID = "test-ios.apps.googleusercontent.com"
+
+var (
+	googleKeyOnce sync.Once
+	googleKey     *rsa.PrivateKey
+)
+
+func googleJWKS(t *testing.T) string {
+	googleKeyOnce.Do(func() { googleKey, _ = rsa.GenerateKey(rand.Reader, 2048) })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
+			"kty": "RSA", "kid": "test-kid",
+			"n": base64.RawURLEncoding.EncodeToString(googleKey.N.Bytes()),
+			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(googleKey.E)).Bytes()),
+		}}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func googleIDToken(t *testing.T, sub, email, name string, mutate ...func(map[string]any)) string {
+	t.Helper()
+	claims := map[string]any{
+		"iss": "https://accounts.google.com", "aud": googleClientID, "sub": sub,
+		"email": email, "email_verified": true, "name": name,
+		"picture": "https://lh3.googleusercontent.com/a/" + sub,
+		"iat":     time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+	}
+	for _, m := range mutate {
+		m(claims)
+	}
+	enc := func(v any) string {
+		b, _ := json.Marshal(v)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	head := enc(map[string]string{"alg": "RS256", "kid": "test-kid"})
+	body := enc(claims)
+	digest := sha256.Sum256([]byte(head + "." + body))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, googleKey, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return head + "." + body + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+func TestGoogleSignIn(t *testing.T) {
+	e := setup(t)
+	google := func(token string) resp {
+		return e.do("POST", "/v1/auth/google", "", map[string]any{"id_token": token})
+	}
+
+	// 1. Daftar: akun baru → 201, is_new_user true, nama & foto dari Google.
+	r := google(googleIDToken(t, "g-100", "Budi.Santoso@gmail.com", "Budi Santoso"))
+	expect(t, r, 201, "")
+	if r.data()["is_new_user"] != true || r.data()["user_name"] != "Budi Santoso" || r.data()["user_image"] != "https://lh3.googleusercontent.com/a/g-100" {
+		t.Fatalf("daftar google: %v", r.data())
+	}
+	token := r.data()["access_token"].(string)
+	me := e.do("GET", "/v1/me", token, nil).data()
+	if me["email"] != "budi.santoso@gmail.com" {
+		t.Fatalf("email harus lowercase: %v", me["email"])
+	}
+
+	// 2. Masuk lagi (sub sama, walau nama di Google berubah) → 200, akun yang sama.
+	r = google(googleIDToken(t, "g-100", "budi.santoso@gmail.com", "Budi S"))
+	expect(t, r, 200, "")
+	if r.data()["is_new_user"] != false || e.do("GET", "/v1/me", r.data()["access_token"].(string), nil).data()["id"] != me["id"] {
+		t.Fatal("login google kedua harus ke akun yang sama")
+	}
+
+	// 3. Akun Google tanpa password → login password ditolak dengan petunjuk.
+	expect(t, e.do("POST", "/v1/auth/login", "", map[string]any{"email": "budi.santoso@gmail.com", "password": "apapun123"}),
+		401, "USE_GOOGLE_SIGN_IN")
+	// Register email+password dengan email yang sama → 409.
+	expect(t, e.do("POST", "/v1/auth/register", "", map[string]any{"email": "budi.santoso@gmail.com", "password": "rahasia123"}),
+		409, "EMAIL_ALREADY_REGISTERED")
+
+	// 4. Email sudah terdaftar (akun password) → Google ditautkan, data lama tetap (nama Kholis, tier GOLD).
+	r = google(googleIDToken(t, "g-200", "kholis@gmail.com", "Nama Google"))
+	expect(t, r, 200, "")
+	linked := e.do("GET", "/v1/me", r.data()["access_token"].(string), nil).data()
+	if r.data()["is_new_user"] != false || linked["name"] != "Kholis" || linked["member_tier"] != "GOLD" {
+		t.Fatalf("tautkan google ke akun lama: %v / %v", r.data(), linked)
+	}
+	// Password lama tetap bisa dipakai.
+	e.login("kholis@gmail.com", "12345678")
+	// Email sama dari akun Google lain → ditolak.
+	expect(t, google(googleIDToken(t, "g-999", "kholis@gmail.com", "Penyusup")), 409, "EMAIL_ALREADY_REGISTERED")
+
+	// 5. Token tidak valid.
+	expect(t, google(googleIDToken(t, "g-300", "x@gmail.com", "X", func(c map[string]any) { c["aud"] = "app-lain" })), 401, "INVALID_GOOGLE_TOKEN")
+	expect(t, google(googleIDToken(t, "g-300", "x@gmail.com", "X", func(c map[string]any) { c["email_verified"] = false })), 401, "INVALID_GOOGLE_TOKEN")
+	expect(t, google(googleIDToken(t, "g-300", "x@gmail.com", "X", func(c map[string]any) { c["exp"] = time.Now().Add(-time.Hour).Unix() })), 401, "INVALID_GOOGLE_TOKEN")
+	expect(t, google("bukan-token"), 401, "INVALID_GOOGLE_TOKEN")
+	expect(t, e.do("POST", "/v1/auth/google", "", map[string]any{}), 400, "VALIDATION_ERROR")
+}
+
+func TestGoogleSignInDisabled(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL belum di-set; integration test dilewati")
+	}
+	pool, err := database.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	resetDB(t, pool)
+	cfg := config.Config{Env: "dev", APIKeys: []string{apiKey}, JWTSecret: "test-secret-test-secret-test-secret",
+		JWTAccessTTL: time.Minute, JWTRefreshTTL: time.Hour, Timezone: time.UTC, LoginRateLimit: 100}
+	srv := httptest.NewServer(server.NewRouter(cfg, pool))
+	t.Cleanup(srv.Close)
+	e := &env{t: t, srv: srv, pool: pool}
+	expect(t, e.do("POST", "/v1/auth/google", "", map[string]any{"id_token": "x.y.z"}), 503, "GOOGLE_SIGN_IN_DISABLED")
 }

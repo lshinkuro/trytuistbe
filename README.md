@@ -78,6 +78,7 @@ Semua di bawah `/v1` butuh header `X-API-Key`. 🔒 = butuh `Authorization: Bear
 | GET | `/healthz` | tanpa API key |
 | POST | `/v1/auth/register` · `/login` · `/refresh` | login: rate limit 5/menit/IP+email |
 | POST | `/v1/auth/logout` | 🔒 |
+| POST | `/v1/auth/google` | daftar/masuk dengan Google (`id_token`). 201 = akun baru, 200 = akun lama. Butuh `GOOGLE_CLIENT_IDS` |
 | GET | `/v1/banners` · `/categories` · `/products` · `/products/{id}` · `/stores?lat=&lng=` | |
 | POST | `/v1/orders/quote` · `/v1/orders` | 🔒 `Idempotency-Key` opsional |
 | GET | `/v1/orders?status=&page=&limit=` · `/v1/orders/{id}` | 🔒 |
@@ -149,3 +150,11 @@ curl -s localhost:8080/v1/dev/orders/<order_id>/status \
 1. `make run`
 2. `Configs/Dev.xcconfig` → `USE_MOCK_DATA = NO`, `API_KEY = dev-local-api-key`.
 3. Scheme **TryTuist-Dev** di simulator (bisa langsung ke `localhost`). Device fisik: pakai IP Mac, mis. `http:/$()/192.168.1.10:8080`.
+
+## Login dengan Google
+
+1. Google Cloud Console → **APIs & Services → Credentials → Create credentials → OAuth client ID → iOS**. Isi Bundle ID app (`com.lshinkuro.TryTuist.dev` untuk Dev, `.staging`, dan tanpa akhiran untuk Prod).
+2. Salin **Client ID** ke `.env` backend: `GOOGLE_CLIENT_IDS=<client-id-dev>,<client-id-prod>` lalu restart server.
+3. Isi Client ID yang sama di iOS (`Configs/<Env>.xcconfig` → `GOOGLE_CLIENT_ID` & `GOOGLE_REVERSED_CLIENT_ID`).
+
+Backend memverifikasi `id_token` sendiri (tanda tangan RS256 dengan kunci publik Google, `aud` = salah satu `GOOGLE_CLIENT_IDS`, `email_verified`), tanpa library tambahan. Email yang sudah terdaftar dengan password otomatis ditautkan ke Google.

@@ -9,11 +9,21 @@ import (
 )
 
 type User struct {
-	ID           string
-	Name         string
-	Email        string
+	ID    string
+	Name  string
+	Email string
+	// "" = akun hanya bisa masuk lewat Google.
 	PasswordHash string
 	AvatarURL    *string
+	GoogleSub    *string
+}
+
+const userColumns = `id::text, name, email, COALESCE(password_hash, ''), avatar_url, google_sub`
+
+func scanUser(row interface{ Scan(...any) error }) (User, error) {
+	var u User
+	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.AvatarURL, &u.GoogleSub)
+	return u, err
 }
 
 type RefreshToken struct {
@@ -35,21 +45,35 @@ func (Repository) CreateUser(ctx context.Context, db database.DBTX, name, email,
 }
 
 func (Repository) UserByEmail(ctx context.Context, db database.DBTX, email string) (User, error) {
-	var u User
-	err := db.QueryRow(ctx, `
-		SELECT id::text, name, email, password_hash, avatar_url
-		FROM users WHERE lower(email) = lower($1)`, email).
-		Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.AvatarURL)
-	return u, err
+	return scanUser(db.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE lower(email) = lower($1)`, email))
 }
 
 func (Repository) UserByID(ctx context.Context, db database.DBTX, id string) (User, error) {
-	var u User
-	err := db.QueryRow(ctx, `
-		SELECT id::text, name, email, password_hash, avatar_url
-		FROM users WHERE id = $1`, id).
-		Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.AvatarURL)
-	return u, err
+	return scanUser(db.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id))
+}
+
+// UserByEmailForUpdate: dipakai saat menautkan Google ke akun lama (cegah dua tautan bersamaan).
+func (Repository) UserByEmailForUpdate(ctx context.Context, db database.DBTX, email string) (User, error) {
+	return scanUser(db.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE lower(email) = lower($1) FOR UPDATE`, email))
+}
+
+func (Repository) UserByGoogleSub(ctx context.Context, db database.DBTX, sub string) (User, error) {
+	return scanUser(db.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE google_sub = $1`, sub))
+}
+
+// LinkGoogle menautkan akun Google; foto profil Google dipakai bila user belum punya foto.
+func (Repository) LinkGoogle(ctx context.Context, db database.DBTX, userID, sub string, picture *string) (User, error) {
+	return scanUser(db.QueryRow(ctx, `
+		UPDATE users SET google_sub = $2, avatar_url = COALESCE(avatar_url, $3), updated_at = now()
+		WHERE id = $1
+		RETURNING `+userColumns, userID, sub, picture))
+}
+
+func (Repository) CreateGoogleUser(ctx context.Context, db database.DBTX, name, email, sub string, picture, fcm *string) (User, error) {
+	return scanUser(db.QueryRow(ctx, `
+		INSERT INTO users (name, email, google_sub, avatar_url, fcm_token)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING `+userColumns, name, email, sub, picture, fcm))
 }
 
 func (Repository) UpdateFCMToken(ctx context.Context, db database.DBTX, userID, token string) error {

@@ -24,6 +24,9 @@ type Config struct {
 	DeliveryFee             int64
 	FreeDeliveryMinSubtotal int64 // 0 = nonaktif
 	LoginRateLimit          int   // percobaan per menit per IP + email
+	// Google Sign-In: OAuth client ID iOS (boleh lebih dari satu: Dev/Staging/Prod). Kosong = nonaktif.
+	GoogleClientIDs []string
+	GoogleJWKSURL   string
 }
 
 func (c Config) IsDev() bool  { return c.Env == "dev" }
@@ -88,6 +91,12 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.LoginRateLimit = int(rl)
+	for _, id := range strings.Split(get("GOOGLE_CLIENT_IDS", ""), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			cfg.GoogleClientIDs = append(cfg.GoogleClientIDs, id)
+		}
+	}
+	cfg.GoogleJWKSURL = get("GOOGLE_JWKS_URL", "https://www.googleapis.com/oauth2/v3/certs")
 	return cfg, nil
 }
 

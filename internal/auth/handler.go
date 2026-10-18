@@ -22,6 +22,11 @@ type loginRequest struct {
 	FCMToken string `json:"fcm_token" validate:"max=4096"`
 }
 
+type googleRequest struct {
+	IDToken  string `json:"id_token" validate:"required,max=8192"`
+	FCMToken string `json:"fcm_token" validate:"max=4096"`
+}
+
 type refreshRequest struct {
 	RefreshToken string `json:"refresh_token" validate:"required,max=200"`
 }
@@ -37,6 +42,8 @@ type SessionDTO struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
+	// true = akun baru dibuat (register / Google pertama kali) → iOS bisa menampilkan sambutan.
+	IsNewUser bool `json:"is_new_user"`
 }
 
 func toSessionDTO(s Session) SessionDTO {
@@ -50,6 +57,7 @@ func toSessionDTO(s Session) SessionDTO {
 		AccessToken:  s.AccessToken,
 		RefreshToken: s.RefreshToken,
 		ExpiresAt:    s.ExpiresAt,
+		IsNewUser:    s.IsNewUser,
 	}
 }
 
@@ -102,6 +110,32 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	h.loginLimiter.Reset(key)
 	httpx.JSON(w, http.StatusOK, toSessionDTO(sess))
+}
+
+// POST /v1/auth/google — daftar / masuk dengan Google (body: id_token dari Google Sign-In).
+// 201 bila akun baru dibuat, 200 bila akun sudah ada.
+func (h *Handler) Google(w http.ResponseWriter, r *http.Request) {
+	var req googleRequest
+	if err := httpx.Decode(r, &req); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	key := httpx.ClientIP(r) + "|google"
+	if !h.loginLimiter.Allow(key) {
+		httpx.Error(w, http.StatusTooManyRequests, "RATE_LIMITED", "Terlalu banyak percobaan masuk. Coba lagi dalam 1 menit.")
+		return
+	}
+	sess, err := h.svc.Google(r.Context(), GoogleInput{IDToken: req.IDToken, FCMToken: req.FCMToken, UserAgent: r.UserAgent()})
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	h.loginLimiter.Reset(key)
+	status := http.StatusOK
+	if sess.IsNewUser {
+		status = http.StatusCreated
+	}
+	httpx.JSON(w, status, toSessionDTO(sess))
 }
 
 // POST /v1/auth/refresh
