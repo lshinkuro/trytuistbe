@@ -42,9 +42,17 @@ type env struct {
 	srv  *httptest.Server
 	pool *pgxpool.Pool
 	app  *server.App
+	// keySeq: Idempotency-Key otomatis di helper do().
+	keySeq int
 }
 
 func setup(t *testing.T, opts ...server.Option) *env {
+	t.Helper()
+	return setupWith(t, nil, opts...)
+}
+
+// setupWith: seperti setup, dengan config yang bisa diubah (mis. batas rate limit).
+func setupWith(t *testing.T, tweak func(*config.Config), opts ...server.Option) *env {
 	t.Helper()
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -64,6 +72,9 @@ func setup(t *testing.T, opts ...server.Option) *env {
 		JWTAccessTTL: 15 * time.Minute, JWTRefreshTTL: time.Hour, Timezone: time.FixedZone("WIB", 7*3600),
 		DeliveryFee: 10000, LoginRateLimit: 100,
 		GoogleClientIDs: []string{googleClientID}, GoogleJWKSURL: googleJWKS(t),
+	}
+	if tweak != nil {
+		tweak(&cfg)
 	}
 	app := server.NewApp(cfg, pool, opts...)
 	srv := httptest.NewServer(app.Handler)
@@ -111,8 +122,15 @@ func (e *env) do(method, path, token string, body any, headers ...string) resp {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	hasKey := false
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
+		hasKey = hasKey || strings.EqualFold(headers[i], "Idempotency-Key")
+	}
+	// Header wajib untuk buat pesanan / checkout: test yang tidak menyebutnya dapat key unik.
+	if method == http.MethodPost && (path == "/v1/orders" || path == "/v1/checkout") && !hasKey {
+		e.keySeq++
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("test-%d", e.keySeq))
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {

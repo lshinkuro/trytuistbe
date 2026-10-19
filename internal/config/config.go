@@ -24,6 +24,11 @@ type Config struct {
 	DeliveryFee             int64
 	FreeDeliveryMinSubtotal int64 // 0 = nonaktif
 	LoginRateLimit          int   // percobaan per menit per IP + email
+	// Batas lain (0 = tanpa batas): request yang mengubah data per user/menit, checkout & buat
+	// pesanan per user/menit, daftar & refresh token per IP/menit.
+	WriteRateLimit    int
+	CheckoutRateLimit int
+	AuthRateLimit     int
 	// Google Sign-In: OAuth client ID iOS (boleh lebih dari satu: Dev/Staging/Prod). Kosong = nonaktif.
 	GoogleClientIDs []string
 	GoogleJWKSURL   string
@@ -113,6 +118,21 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.LoginRateLimit = int(rl)
+	for _, l := range []struct {
+		env string
+		def int64
+		dst *int
+	}{
+		{"WRITE_RATE_LIMIT", 60, &cfg.WriteRateLimit},
+		{"CHECKOUT_RATE_LIMIT", 10, &cfg.CheckoutRateLimit},
+		{"AUTH_RATE_LIMIT", 10, &cfg.AuthRateLimit},
+	} {
+		v, err := getInt(l.env, l.def)
+		if err != nil {
+			return cfg, err
+		}
+		*l.dst = int(v)
+	}
 	for _, id := range strings.Split(get("GOOGLE_CLIENT_IDS", ""), ",") {
 		if id = strings.TrimSpace(id); id != "" {
 			cfg.GoogleClientIDs = append(cfg.GoogleClientIDs, id)

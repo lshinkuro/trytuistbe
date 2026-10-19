@@ -104,6 +104,10 @@ var ErrPaymentRequired = httpx.Unprocessable("PAYMENT_REQUIRED", "Pesanan dengan
 
 // DecodeCreate: body POST /v1/orders → CreateInput (dipakai juga POST /v1/checkout).
 func DecodeCreate(r *http.Request) (CreateInput, error) {
+	key, err := httpx.IdempotencyKey(r)
+	if err != nil {
+		return CreateInput{}, err
+	}
 	var req createRequest
 	if err := httpx.Decode(r, &req); err != nil {
 		return CreateInput{}, err
@@ -113,6 +117,6 @@ func DecodeCreate(r *http.Request) (CreateInput, error) {
 		PaymentMethod:   req.PaymentMethod,
 		PaymentMethodID: req.PaymentMethodID,
 		Note:            req.Note,
-		IdempotencyKey:  r.Header.Get("Idempotency-Key"),
+		IdempotencyKey:  key,
 	}, nil
 }

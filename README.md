@@ -73,6 +73,12 @@ Pola per modul sama seperti iOS: **handler** (HTTP) → **service** (aturan bisn
 
 ## Endpoint
 
+**Penjagaan penyalahgunaan:**
+- Rate limit (429 `RATE_LIMITED` + `Retry-After`): login 5/menit per IP+email; daftar & refresh `AUTH_RATE_LIMIT`/menit per IP; request yang mengubah data `WRITE_RATE_LIMIT`/menit per user; checkout & buat pesanan `CHECKOUT_RATE_LIMIT`/menit per user.
+- IP klien: `X-Forwarded-For` hanya dipercaya dari proxy di jaringan internal (loopback/private, mis. Caddy), dan yang dipakai entri terakhir. Request langsung dari internet memakai IP koneksi.
+- `POST /v1/orders` & `/v1/checkout` wajib `Idempotency-Key`: klik ganda / retry tidak membuat pesanan atau sesi bayar ganda.
+- Limiter disimpan di memori (cukup untuk satu instance API).
+
 **Swagger UI:** buka [http://localhost:8080/docs](http://localhost:8080/docs) setelah `make run` (juga di staging; dimatikan di prod). Spec-nya `docs/openapi.yaml` (OpenAPI 3), bisa diimpor ke Postman / Insomnia. Klik **Authorize** → isi `X-API-Key`, panggil `POST /v1/auth/login`, lalu tempel `access_token` ke `bearerAuth`.
 Menambah atau mengubah endpoint wajib memperbarui `docs/openapi.yaml`: `TestOpenAPICoversRoutes` gagal bila ada route yang belum tertulis (atau path di spec yang sudah tidak ada).
 
@@ -81,11 +87,11 @@ Semua di bawah `/v1` butuh header `X-API-Key`. 🔒 = butuh `Authorization: Bear
 | Method | Path | |
 |---|---|---|
 | GET | `/healthz` | tanpa API key |
-| POST | `/v1/auth/register` · `/login` · `/refresh` | login: rate limit 5/menit/IP+email |
+| POST | `/v1/auth/register` · `/login` · `/refresh` | login: 5/menit/IP+email · daftar & refresh: `AUTH_RATE_LIMIT`/menit/IP |
 | POST | `/v1/auth/logout` | 🔒 |
 | POST | `/v1/auth/google` | daftar/masuk dengan Google (`id_token`). 201 = akun baru, 200 = akun lama. Butuh `GOOGLE_CLIENT_IDS` |
 | GET | `/v1/banners` · `/categories` · `/products` · `/products/{id}` · `/stores?lat=&lng=` | produk: `?store_id=` → stok outlet itu · stores: buka → menjangkau → terdekat |
-| POST | `/v1/orders/quote` · `/v1/orders` | 🔒 `Idempotency-Key` opsional |
+| POST | `/v1/orders/quote` · `/v1/orders` | 🔒 `/v1/orders`: header `Idempotency-Key` **wajib**, `CHECKOUT_RATE_LIMIT`/menit/user |
 | POST | `/v1/checkout` | 🔒 `Idempotency-Key` · COD → pesanan; Bayar Online → sesi Midtrans Snap (`redirect_url`), pesanan dibuat setelah lunas (§5.27) |
 | GET / POST | `/v1/payments?status=` · `/v1/payments/{id}` · `/v1/payments/{id}/cancel` | 🔒 · status sesi (server ikut cek ke Midtrans saat PENDING), batal |
 | POST | `/v1/payments/midtrans/notification` | **tanpa** `X-API-Key`; webhook Midtrans, divalidasi `signature_key` |

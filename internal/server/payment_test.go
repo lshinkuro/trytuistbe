@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"trytuist-api/internal/config"
 	"trytuist-api/internal/payment"
 	"trytuist-api/internal/server"
 )
@@ -773,4 +774,35 @@ func byIDList(list []any, id string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// TestAbuseProtection: Idempotency-Key wajib & rate limit request yang mengubah data, checkout, dan daftar.
+func TestAbuseProtection(t *testing.T) {
+	e := setupWith(t, func(c *config.Config) { c.CheckoutRateLimit, c.AuthRateLimit, c.WriteRateLimit = 2, 2, 6 })
+	token, _ := e.login("kholis@gmail.com", "12345678")
+	cart := map[string]any{"store_id": "ST01", "payment_method_id": "COD", "items": []map[string]any{{"product_id": "P01", "quantity": 1}}}
+
+	// Tanpa Idempotency-Key → 400, tidak ada pesanan dibuat.
+	expect(t, e.do("POST", "/v1/orders", token, cart, "Idempotency-Key", ""), 400, "VALIDATION_ERROR")
+	expect(t, e.do("POST", "/v1/checkout", token, cart, "Idempotency-Key", ""), 400, "VALIDATION_ERROR")
+
+	// Checkout: 2/menit per user (dua 400 di atas sudah dihitung) → berikutnya 429.
+	expect(t, e.do("POST", "/v1/checkout", token, cart), 429, "RATE_LIMITED")
+	other, _ := e.login("demo@trytuist.com", "password123")
+	expect(t, e.do("POST", "/v1/checkout", other, cart), 201, "")
+
+	// Request yang mengubah data: 6/menit per user (3 POST di atas, termasuk yang ditolak); GET tidak dihitung.
+	for _, name := range []string{"Kholis A", "Kholis B", "Kholis C"} {
+		expect(t, e.do("PATCH", "/v1/me", token, map[string]any{"name": name}), 200, "")
+	}
+	expect(t, e.do("PATCH", "/v1/me", token, map[string]any{"name": "Kholis D"}), 429, "RATE_LIMITED")
+	expect(t, e.do("GET", "/v1/me", token, nil), 200, "")
+
+	// Daftar akun: 2/menit per IP.
+	reg := func(email string) resp {
+		return e.do("POST", "/v1/auth/register", "", map[string]any{"email": email, "password": "rahasia123", "name": "Spam"})
+	}
+	expect(t, reg("a1@example.com"), 201, "")
+	expect(t, reg("a2@example.com"), 201, "")
+	expect(t, reg("a3@example.com"), 429, "RATE_LIMITED")
 }

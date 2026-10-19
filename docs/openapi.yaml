@@ -80,6 +80,7 @@ paths:
         "201": { $ref: "#/components/responses/Session" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
   /v1/auth/login:
     post:
       tags: [Auth]
@@ -136,6 +137,7 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Session" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
   /v1/auth/logout:
     post:
       tags: [Auth]
@@ -435,6 +437,7 @@ paths:
                       data: { $ref: "#/components/schemas/Order" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/QuoteRejected" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
   /v1/orders/{id}:
     get:
       tags: [Pesanan]
@@ -518,6 +521,7 @@ paths:
         "200": { $ref: "#/components/responses/Checkout" }
         "201": { $ref: "#/components/responses/Checkout" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "422": { $ref: "#/components/responses/QuoteRejected" }
         "502": { $ref: "#/components/responses/BadGateway" }
   /v1/payments:
@@ -1432,7 +1436,8 @@ components:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
-      description: UUID dari client; retry dengan key yang sama tidak membuat pesanan / sesi ganda
+      required: true
+      description: "Wajib. UUID dari client; retry dengan key yang sama tidak membuat pesanan / sesi ganda (tanpa header → 400)"
       schema: { type: string, format: uuid }
 
   responses:
@@ -1628,7 +1633,7 @@ components:
         `FREE_DELIVERY_UNAVAILABLE` (fitur kupon dimatikan), `FREE_DELIVERY_QUOTA_EXCEEDED` (kupon minggu ini habis)
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     TooManyRequests:
-      description: "`TOO_MANY_REQUESTS`"
+      description: "`RATE_LIMITED` — tunggu sesuai header `Retry-After` (detik)"
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     BadGateway:
       description: "`PAYMENT_GATEWAY_ERROR` — Midtrans gangguan / timeout"

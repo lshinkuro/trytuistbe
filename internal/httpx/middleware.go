@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -179,20 +180,53 @@ func WithUserID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, userIDKey, id)
 }
 
-// ClientIP: IP client (memperhitungkan X-Forwarded-For dari reverse proxy).
+// ClientIP: IP client untuk rate limit. X-Forwarded-For / X-Real-IP hanya dipercaya bila request
+// datang dari proxy di jaringan internal (loopback / private, mis. Caddy di jaringan Docker), dan
+// yang dipakai entri TERAKHIR (ditambahkan proxy kita). Entri awal bisa diisi bebas oleh klien.
+// Request langsung dari internet memakai IP koneksi, jadi header palsu tidak berpengaruh.
 func ClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first, _, _ := strings.Cut(xff, ",")
-		return strings.TrimSpace(first)
-	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		return xr
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip == nil || !(ip.IsLoopback() || ip.IsPrivate()) {
+		return host
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+			return last
+		}
+	}
+	if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+		return xr
 	}
 	return host
+}
+
+// RateLimit menolak request dengan 429 bila key melewati batas limiter. key "" = tidak dihitung.
+func RateLimit(rl *RateLimiter, key func(*http.Request) string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if k := key(r); k != "" && !rl.Allow(k) {
+				w.Header().Set("Retry-After", strconv.Itoa(int(rl.window.Seconds())))
+				Error(w, http.StatusTooManyRequests, "RATE_LIMITED", "Terlalu banyak permintaan. Coba lagi sebentar lagi.")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ByUser: key rate limit per user login (dipasang setelah Auth).
+func ByUser(r *http.Request) string { return UserID(r.Context()) }
+
+// ByUserWrites: hanya request yang mengubah data (bukan GET/HEAD) yang dihitung.
+func ByUserWrites(r *http.Request) string {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return ""
+	}
+	return UserID(r.Context())
 }
 
 // RateLimiter: sliding window sederhana di memori (cukup untuk satu instance).

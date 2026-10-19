@@ -146,3 +146,14 @@ func ParsePage(q url.Values, defLimit int) (Page, error) {
 	}
 	return p, nil
 }
+
+// IdempotencyKey: header Idempotency-Key wajib untuk membuat pesanan / sesi bayar, supaya klik ganda
+// atau retry jaringan tidak membuat transaksi ganda.
+func IdempotencyKey(r *http.Request) (string, error) {
+	k := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if k == "" {
+		return "", Validation("Header Idempotency-Key wajib diisi.",
+			FieldDetail{Field: "Idempotency-Key", Message: "kirim UUID unik per pesanan; pakai ulang saat mengulang request yang sama"})
+	}
+	return k, nil
+}

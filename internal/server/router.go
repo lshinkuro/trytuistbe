@@ -136,12 +136,16 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 	r.Post("/v1/payments/midtrans/notification", checkoutH.Notification)
 	r.Get("/v1/payments/finish", checkoutH.Finish)
 
+	writeLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.WriteRateLimit, time.Minute), httpx.ByUserWrites)
+	checkoutLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.CheckoutRateLimit, time.Minute), httpx.ByUser)
+	authLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.AuthRateLimit, time.Minute), httpx.ClientIP)
+
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(httpx.APIKey(cfg.APIKeys))
 
 		r.Post("/auth/login", authH.Login) // rate limit di handler (per IP + email)
-		r.Post("/auth/register", authH.Register)
-		r.Post("/auth/refresh", authH.Refresh)
+		r.With(authLimit).Post("/auth/register", authH.Register)
+		r.With(authLimit).Post("/auth/refresh", authH.Refresh)
 		r.Post("/auth/google", authH.Google) // daftar & masuk dengan Google (rate limit per IP)
 
 		r.Get("/banners", catalogH.Banners)
@@ -164,17 +168,17 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 		})
 
 		r.Group(func(r chi.Router) {
-			r.Use(httpx.Auth(tokens)) // 🔒
+			r.Use(httpx.Auth(tokens), writeLimit) // 🔒
 			r.Post("/auth/logout", authH.Logout)
 
 			r.Post("/orders/quote", orderH.Quote)
-			r.Post("/orders", orderH.Create)
+			r.With(checkoutLimit).Post("/orders", orderH.Create)
 			r.Get("/orders", orderH.List)
 			r.Get("/orders/{id}", orderH.Get)
 			r.Post("/orders/{id}/cancel", orderH.Cancel)
 			r.Post("/orders/{id}/rating", orderH.Rate)
 
-			r.Post("/checkout", checkoutH.Checkout)
+			r.With(checkoutLimit).Post("/checkout", checkoutH.Checkout)
 			r.Get("/payments", checkoutH.List)
 			r.Get("/payments/{id}", checkoutH.Get)
 			r.Post("/payments/{id}/cancel", checkoutH.Cancel)
@@ -207,7 +211,7 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 
 		// Web admin (§5.25): login biasa + role ADMIN.
 		r.Route("/admin", func(r chi.Router) {
-			r.Use(httpx.Auth(tokens), admin.RequireAdmin(pool))
+			r.Use(httpx.Auth(tokens), admin.RequireAdmin(pool), writeLimit)
 			r.Get("/me", adminH.Me)
 			r.Get("/dashboard", adminH.Dashboard)
 			r.Get("/orders", adminH.Orders)

@@ -290,20 +290,14 @@ func (h *Handler) Quote(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, toQuoteDTO(q))
 }
 
-// POST /v1/orders 🔒 — header opsional Idempotency-Key.
+// POST /v1/orders 🔒 — header Idempotency-Key wajib.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
-	var req createRequest
-	if err := httpx.Decode(r, &req); err != nil {
+	in, err := DecodeCreate(r)
+	if err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
-	o, err := h.svc.Create(r.Context(), httpx.UserID(r.Context()), CreateInput{
-		QuoteInput:      req.toInput(),
-		PaymentMethod:   req.PaymentMethod,
-		PaymentMethodID: req.PaymentMethodID,
-		Note:            req.Note,
-		IdempotencyKey:  r.Header.Get("Idempotency-Key"),
-	})
+	o, err := h.svc.Create(r.Context(), httpx.UserID(r.Context()), in)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
