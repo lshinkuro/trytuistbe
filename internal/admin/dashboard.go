@@ -4,7 +4,6 @@ import (
 	"context"
 	"math"
 	"net/http"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -95,9 +94,13 @@ func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
-	storeID := ""
-	if s := strings.TrimSpace(r.URL.Query().Get("store_id")); s != "" {
-		store, ok, err := h.catalog.StoreByID(r.Context(), s, false)
+	storeID, err := scopeStore(r.Context(), r.URL.Query().Get("store_id"))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	if storeID != "" {
+		store, ok, err := h.catalog.StoreByID(r.Context(), storeID, false)
 		if err == nil && !ok {
 			err = httpx.Validation("Outlet tidak ditemukan.", httpx.FieldDetail{Field: "store_id", Message: "tidak ditemukan"})
 		}

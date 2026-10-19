@@ -204,14 +204,11 @@ func (h *Handler) sections(ctx context.Context, storeID string) ([]map[string]an
 			if d.Rule != nil {
 				rule = *d.Rule
 			}
-			products, err := h.catalog.SectionProducts(ctx, rule, d.ProductIDs, d.Limit)
-			if err == nil {
-				err = h.catalog.ApplyStoreAvailability(ctx, storeID, products)
-			}
+			// Hanya menu yang dijual & masih ada stoknya di outlet ini.
+			products, err := h.catalog.SectionProducts(ctx, rule, d.ProductIDs, d.Limit, storeID)
 			if err != nil {
 				return nil, err
 			}
-			products = availableOnly(products) // habis di outlet ini → tidak ditampilkan di Beranda
 			if len(products) == 0 {
 				continue // section produk kosong tidak dikirim
 			}
@@ -223,16 +220,6 @@ func (h *Handler) sections(ctx context.Context, storeID string) ([]map[string]an
 		out = append(out, sec)
 	}
 	return out, nil
-}
-
-func availableOnly(in []catalog.Product) []catalog.Product {
-	out := in[:0]
-	for _, p := range in {
-		if p.IsAvailable {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func head[T any](s []T, n int) []T {

@@ -1,0 +1,53 @@
+# Produksi di satu VPS: Postgres + API + Caddy (HTTPS otomatis Let's Encrypt).
+# Dipakai dari folder deploy di server (mis. /opt/trytuist), bersama .env.prod & Caddyfile.
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# Migrasi TIDAK jalan otomatis saat api start: CI menjalankan service `migrate` dulu (lihat deploy.sh).
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+    # Tidak dibuka ke internet: hanya bisa diakses dari jaringan compose.
+
+  migrate:
+    image: ${API_IMAGE}
+    env_file: .env.prod
+    entrypoint: ["/app/migrate"]
+    command: ["up"]
+    depends_on:
+      db: { condition: service_healthy }
+    profiles: ["tools"] # hanya jalan saat dipanggil: docker compose run --rm migrate
+
+  api:
+    image: ${API_IMAGE}
+    restart: unless-stopped
+    env_file: .env.prod
+    volumes:
+      - ./secrets:/secrets:ro # AuthKey_XXXX.p8 untuk APNs (APNS_KEY_FILE=/secrets/AuthKey_XXXX.p8)
+    depends_on:
+      db: { condition: service_healthy }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      API_DOMAIN: ${API_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

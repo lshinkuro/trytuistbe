@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -47,6 +48,7 @@ type AdminOrderDTO struct {
 	StatusHistory []AdminStatusEventDTO `json:"status_history"`
 	Customer      CustomerDTO           `json:"customer"`
 	NextStatuses  []string              `json:"next_statuses"`
+	Payment       *orderPaymentRefDTO   `json:"payment"` // null untuk COD
 }
 
 const orderListLimit = 20
@@ -83,13 +85,17 @@ func (h *Handler) Orders(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(q.Get("q"))
 	like := "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search) + "%"
 
-	storeID := strings.TrimSpace(q.Get("store_id"))
 	where := `WHERE (cardinality($1::text[]) = 0 OR o.status::text = ANY($1))
 		AND ($2::timestamptz IS NULL OR o.created_at >= $2)
 		AND ($3::timestamptz IS NULL OR o.created_at < $3)
 		AND ($4 = '' OR o.order_number ILIKE $5 OR u.name ILIKE $5 OR u.email ILIKE $5)
 		AND ($8 = '' OR o.store_id = $8)`
 	ctx := r.Context()
+	storeID, err := scopeStore(ctx, q.Get("store_id"))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
 	var total int
 	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM orders o JOIN users u ON u.id = o.user_id `+
 		strings.ReplaceAll(where, "$8", "$6"), statuses, from, to, search, like, storeID).Scan(&total); err != nil {
@@ -154,12 +160,28 @@ func (h *Handler) orderDTO(r *http.Request, o order.Order) (AdminOrderDTO, error
 	}
 	err := h.pool.QueryRow(r.Context(), `SELECT id::text, name, email, phone FROM users WHERE id = $1`, o.UserID).
 		Scan(&dto.Customer.ID, &dto.Customer.Name, &dto.Customer.Email, &dto.Customer.Phone)
+	if err != nil {
+		return dto, err
+	}
+	dto.Payment, err = h.orderPayment(r.Context(), o.ID)
 	return dto, err
+}
+
+// scopedOrder: pesanan outlet lain tidak terlihat oleh admin outlet (404, bukan 403).
+func (h *Handler) scopedOrder(ctx context.Context, id string) (order.Order, error) {
+	o, err := h.orders.AdminGet(ctx, id)
+	if err != nil {
+		return o, err
+	}
+	if a := adminFrom(ctx); !a.IsSuper() && o.Store.ID != a.StoreID {
+		return order.Order{}, httpx.NotFound("Pesanan tidak ditemukan.")
+	}
+	return o, nil
 }
 
 // GET /v1/admin/orders/{id}
 func (h *Handler) Order(w http.ResponseWriter, r *http.Request) {
-	o, err := h.orders.AdminGet(r.Context(), chi.URLParam(r, "id"))
+	o, err := h.scopedOrder(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -192,6 +214,10 @@ func (h *Handler) UpdateOrderStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a := adminFrom(r.Context())
+	if _, err := h.scopedOrder(r.Context(), chi.URLParam(r, "id")); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
 	o, from, err := h.orders.AdminSetStatus(r.Context(), chi.URLParam(r, "id"), to, order.StatusMeta{Note: req.Note, ActorID: a.ID})
 	if err != nil {
 		httpx.FromError(w, r, err)

@@ -3,12 +3,21 @@ package catalog
 
 import "time"
 
+// Aksi saat banner di-tap.
+const (
+	BannerNone         = "NONE"
+	BannerProduct      = "PRODUCT"       // buka detail produk (ActionValue = id produk)
+	BannerCategory     = "CATEGORY"      // buka menu kategori (ActionValue = id kategori)
+	BannerFreeDelivery = "FREE_DELIVERY" // info kupon gratis ongkir mingguan
+)
+
 type Banner struct {
-	ID       string
-	Title    string
-	Subtitle string
-	ImageURL string
-	Deeplink *string
+	ID          string
+	Title       string
+	Subtitle    string
+	ImageURL    string
+	ActionType  string
+	ActionValue *string
 }
 
 type Category struct {
@@ -37,9 +46,31 @@ type Product struct {
 	SoldCount     int
 	IsAvailable   bool
 	IsBestSeller  bool
-	Options       []Option
-	UpdatedAt     time.Time
+	// Stock: sisa stok di outlet yang diminta; nil = tidak dihitung (atau tanpa outlet).
+	Stock     *int
+	Options   []Option
+	UpdatedAt time.Time
+	// Combo: isi paket (kosong = produk biasa) & total harga bila isinya dibeli satuan.
+	Bundle        []BundleItem
+	SeparatePrice int64
 }
+
+// BundleItem: satu isi combo, dengan harga & ketersediaan isi di outlet yang diminta.
+type BundleItem struct {
+	ProductID   string
+	Name        string
+	OptionID    *string
+	OptionName  *string
+	Quantity    int
+	UnitPrice   int64 // harga satuan isi sekarang (termasuk varian & promo)
+	IsAvailable bool
+	Stock       *int
+}
+
+func (p Product) IsCombo() bool { return len(p.Bundle) > 0 }
+
+// ComboSavings: hemat dibanding membeli isinya satuan (0 bila tidak lebih murah).
+func (p Product) ComboSavings() int64 { return max(p.SeparatePrice-p.Price, 0) }
 
 // OnDeal: produk sedang dijual dengan harga promo.
 func (p Product) OnDeal() bool { return p.OriginalPrice > p.Price }
@@ -81,6 +112,6 @@ type ProductFilter struct {
 	Sort       string // "" | popular | rating | price_asc | price_desc
 	Page       int
 	Limit      int
-	// StoreID: ketersediaan mengikuti outlet ini (§5.26). Harga tetap sama di semua outlet.
+	// StoreID: menu, harga, promo & stok mengikuti outlet ini (§5.29). '' = katalog pusat.
 	StoreID string
 }

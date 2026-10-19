@@ -729,3 +729,37 @@ func statusLabel(s string) string {
 	}
 	return "diproses"
 }
+
+// ===== Dev =====
+
+// DevSimulatedStatuses: transaction_status Midtrans yang bisa disimulasikan.
+var DevSimulatedStatuses = []string{"settlement", "deny", "expire", "cancel"}
+
+// DevSimulate (POST /v1/dev/payments/{id}/simulate, hanya APP_ENV=dev): terapkan status seolah
+// notifikasi Midtrans datang, tanpa membayar di simulator sandbox. Lewat `apply` yang sama dengan
+// webhook, jadi lunas tetap membuat pesanan & mengirim push.
+func (s *Service) DevSimulate(ctx context.Context, userID, id, status, paymentType string) (Payment, error) {
+	p, err := s.owned(ctx, userID, id)
+	if err != nil {
+		return Payment{}, err
+	}
+	if !contains(DevSimulatedStatuses, status) {
+		return Payment{}, httpx.Validation("Status simulasi tidak valid.",
+			httpx.FieldDetail{Field: "status", Message: "harus salah satu dari: " + strings.Join(DevSimulatedStatuses, ", ")})
+	}
+	if p.Status != StatusPending {
+		return Payment{}, httpx.Unprocessable("PAYMENT_NOT_PENDING", "Pembayaran ini sudah "+statusLabel(p.Status)+".")
+	}
+	if paymentType == "" {
+		paymentType = "qris"
+	}
+	st := TransactionStatus{
+		OrderID: p.ProviderOrderID, TransactionID: "SIM-" + p.ID, TransactionStatus: status,
+		PaymentType: paymentType, GrossAmount: fmt.Sprintf("%d.00", p.Amount), StatusMessage: "Simulasi dari debugger",
+	}
+	raw, _ := json.Marshal(st)
+	if err := s.apply(ctx, p.ID, st, "dev-simulate", raw, nil); err != nil {
+		return Payment{}, err
+	}
+	return s.repo.Get(ctx, s.pool, p.ID)
+}

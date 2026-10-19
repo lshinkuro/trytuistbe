@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,14 @@ func TestHTTPGateway(t *testing.T) {
 			_, _ = w.Write([]byte(`{"token":"abc","redirect_url":"https://app.sandbox.midtrans.com/snap/v4/redirection/abc"}`))
 		case r.URL.Path == "/v2/TT-NONE/status":
 			_, _ = w.Write([]byte(`{"status_code":"404","status_message":"Transaction doesn't exist."}`))
+		case r.URL.Path == "/v2/TT-OK/refund":
+			var req RefundRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Amount > 54000 {
+				_, _ = w.Write([]byte(`{"status_code":"413","status_message":"The request could not be processed due to malformed syntax in the request body"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"status_code":"200","status_message":"Success, refund request is approved","transaction_status":"partial_refund"}`))
 		case r.URL.Path == "/v2/TT-OK/status":
 			_, _ = w.Write([]byte(`{"status_code":"200","transaction_status":"settlement","order_id":"TT-OK","gross_amount":"54000.00","payment_type":"gopay"}`))
 		default:
@@ -94,5 +103,12 @@ func TestHTTPGateway(t *testing.T) {
 	}
 	if st, err := g.Status(context.Background(), "TT-OK"); err != nil || st.TransactionStatus != "settlement" {
 		t.Fatalf("Status: %v %v", st, err)
+	}
+	if err := g.Refund(context.Background(), "TT-OK", RefundRequest{RefundKey: "rf-1", Amount: 20000, Reason: "x"}); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	// Midtrans membalas HTTP 200 dengan status_code 4xx di body → tetap ditolak.
+	if err := g.Refund(context.Background(), "TT-OK", RefundRequest{RefundKey: "rf-2", Amount: 99000}); !errors.As(err, &ge) || !strings.HasPrefix(ge.Messages, "413") {
+		t.Fatalf("refund ditolak harus GatewayError 413, dapat %v", err)
 	}
 }

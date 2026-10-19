@@ -44,6 +44,7 @@ func (s *Service) Prepare(ctx context.Context, userID string, in CreateInput) (P
 		return Prepared{}, err
 	}
 	quoteInput := in.QuoteInput
+	quoteInput.skipPendingCoupons = method == "ONLINE"
 	if strings.TrimSpace(quoteInput.AddressID) == "" {
 		id, err := s.repo.DefaultAddressID(ctx, s.pool, userID)
 		if err != nil && !database.IsNoRows(err) {

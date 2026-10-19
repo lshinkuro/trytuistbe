@@ -5,3 +5,5 @@ bin/
 .DS_Store
 *.p8
 secrets/
+.env.prod
+backups/

@@ -59,13 +59,24 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("APP_ENV harus dev | staging | prod, dapat %q", cfg.Env)
 	}
 
-	for _, k := range strings.Split(get("API_KEYS", "dev-local-api-key"), ",") {
+	defKeys := ""
+	if cfg.IsDev() {
+		defKeys = "dev-local-api-key" // hanya dev; staging/prod wajib mengisi API_KEYS sendiri
+	}
+	for _, k := range strings.Split(get("API_KEYS", defKeys), ",") {
 		if k = strings.TrimSpace(k); k != "" {
 			cfg.APIKeys = append(cfg.APIKeys, k)
 		}
 	}
 	if len(cfg.APIKeys) == 0 {
 		return cfg, fmt.Errorf("API_KEYS wajib diisi")
+	}
+	if !cfg.IsDev() {
+		for _, k := range cfg.APIKeys {
+			if k == "dev-local-api-key" || strings.HasSuffix(k, "change-me") {
+				return cfg, fmt.Errorf("API_KEYS di %s masih memakai key contoh; ganti dengan key acak", cfg.Env)
+			}
+		}
 	}
 
 	if cfg.JWTSecret == "" {

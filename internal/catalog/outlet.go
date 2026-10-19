@@ -155,66 +155,6 @@ func (r *Repository) StoreFromQuery(ctx context.Context, storeID string) (*Store
 	return &s, nil
 }
 
-// UnavailableAt: id produk yang ditandai habis di outlet ini.
-func (r *Repository) UnavailableAt(ctx context.Context, storeID string, productIDs []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	if storeID == "" || len(productIDs) == 0 {
-		return out, nil
-	}
-	rows, err := r.db.Query(ctx, `SELECT product_id FROM store_product_availability
-		WHERE store_id = $1 AND NOT is_available AND product_id = ANY($2)`, storeID, productIDs)
-	if err != nil {
-		return nil, err
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	for _, id := range ids {
-		out[id] = true
-	}
-	return out, err
-}
-
-// ApplyStoreAvailability: produk yang habis di outlet ditandai IsAvailable=false.
-func (r *Repository) ApplyStoreAvailability(ctx context.Context, storeID string, products []Product) error {
-	if storeID == "" || len(products) == 0 {
-		return nil
-	}
-	ids := make([]string, len(products))
-	for i, p := range products {
-		ids[i] = p.ID
-	}
-	off, err := r.UnavailableAt(ctx, storeID, ids)
-	if err != nil {
-		return err
-	}
-	for i := range products {
-		if off[products[i].ID] {
-			products[i].IsAvailable = false
-		}
-	}
-	return nil
-}
-
-// ApplyStoreAvailabilityMap: versi map (dipakai quote / checkout).
-func (r *Repository) ApplyStoreAvailabilityMap(ctx context.Context, storeID string, products map[string]Product) error {
-	if storeID == "" || len(products) == 0 {
-		return nil
-	}
-	ids := make([]string, 0, len(products))
-	for id := range products {
-		ids = append(ids, id)
-	}
-	off, err := r.UnavailableAt(ctx, storeID, ids)
-	if err != nil {
-		return err
-	}
-	for id := range off {
-		p := products[id]
-		p.IsAvailable = false
-		products[id] = p
-	}
-	return nil
-}
-
 // PickStore memilih outlet untuk pelanggan: yang buka sekarang & menjangkau alamat dulu,
 // lalu yang terdekat. Tanpa koordinat: outlet buka pertama menurut urutan admin.
 // ok=false bila tidak ada outlet aktif sama sekali.

@@ -1,0 +1,2461 @@
+openapi: 3.0.3
+info:
+  title: TryTuist API
+  version: "1.0"
+  description: |
+    Backend aplikasi iOS **TryTuist** (pesan makanan & minuman) dan web admin. Kontrak lengkap & aturan bisnis: `API_PLAN.md`.
+
+    **Konvensi**
+    - Semua `/v1/*` butuh header `X-API-Key` (kecuali webhook & finish URL Midtrans).
+    - 🔒 = butuh `Authorization: Bearer <access_token>` dari `/v1/auth/login`. 🔒* = token opsional.
+    - Response sukses: `{ code, message, data, meta? }`. Error: `{ code, message, error: { type, details[] } }`.
+    - Uang = integer Rupiah (`15000` = Rp 15.000). Waktu = ISO 8601 (WIB).
+    - List berpaginasi: `?page=1&limit=20` (maks. 100), total di `meta`.
+
+    **Coba di sini:** klik **Authorize**, isi `X-API-Key` (dev: nilai `API_KEYS` di `.env`), panggil `POST /v1/auth/login`
+    (akun demo `kholis@gmail.com / 12345678`, admin `admin@trytuist.com / admin12345`), lalu isi `access_token` di `bearerAuth`.
+servers:
+  - url: /
+    description: Server ini
+  - url: http://localhost:8080
+    description: Dev lokal
+  - url: https://staging-api.trytuist.com
+    description: Staging
+security:
+  - apiKey: []
+tags:
+  - name: Auth
+  - name: Katalog
+  - name: Beranda & konten
+  - name: Pesanan
+  - name: Pembayaran
+    description: Bayar Online lewat Midtrans Snap (API_PLAN §5.27)
+  - name: Profil
+  - name: Notifikasi
+  - name: Dev
+    description: Hanya `APP_ENV=dev`
+  - name: Admin
+    description: Web admin. Role `SUPER_ADMIN` / `OUTLET_ADMIN` (admin outlet dipaksa ke outletnya)
+  - name: Admin (super)
+    description: Khusus `SUPER_ADMIN`
+  - name: Sistem
+
+paths:
+  /healthz:
+    get:
+      tags: [Sistem]
+      summary: Cek server & database
+      security: []
+      responses:
+        "200":
+          description: Sehat
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  env: { type: string, example: dev }
+                  db: { type: string, example: ok }
+        "503": { description: Database tidak bisa dihubungi }
+
+  # ===== Auth =====
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Daftar akun baru
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+                password: { type: string, minLength: 8, maxLength: 72 }
+                name: { type: string, maxLength: 100 }
+                fcm_token: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Masuk dengan email & password
+      description: Rate limit 5 percobaan / menit per IP + email (429).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: kholis@gmail.com }
+                password: { type: string, example: "12345678" }
+                fcm_token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /v1/auth/google:
+    post:
+      tags: [Auth]
+      summary: Daftar / masuk dengan Google
+      description: 201 = akun baru, 200 = akun lama. Butuh `GOOGLE_CLIENT_IDS`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token: { type: string, description: ID token dari GoogleSignIn-iOS }
+                fcm_token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "201": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Tukar refresh token dengan sesi baru (rotation)
+      description: Refresh token lama langsung tidak berlaku. Memakai token lama lagi = reuse → semua sesi user dicabut.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Keluar 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ===== Katalog =====
+  /v1/banners:
+    get:
+      tags: [Katalog]
+      summary: Banner Beranda
+      responses:
+        "200": { $ref: "#/components/responses/BannerList" }
+  /v1/categories:
+    get:
+      tags: [Katalog]
+      summary: Kategori menu aktif
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CategoryListEnvelope" }
+  /v1/products:
+    get:
+      tags: [Katalog]
+      summary: Daftar menu
+      description: Dengan `store_id`, harga, promo, stok & menu yang dijual mengikuti outlet itu.
+      parameters:
+        - { $ref: "#/components/parameters/StoreId" }
+        - { name: category_id, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string, maxLength: 100 } }
+        - { name: sort, in: query, schema: { type: string, enum: [popular, rating, price_asc, price_desc] } }
+        - { name: best_seller, in: query, schema: { type: boolean } }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductListEnvelope" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/products/{id}:
+    get:
+      tags: [Katalog]
+      summary: Detail menu
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, example: P01 } }
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/stores:
+    get:
+      tags: [Katalog]
+      summary: Outlet aktif
+      description: Urutan buka → menjangkau koordinat → terdekat. `lat` & `lng` dikirim berdua atau tidak sama sekali.
+      parameters:
+        - { name: lat, in: query, schema: { type: number, example: -6.26 } }
+        - { name: lng, in: query, schema: { type: number, example: 106.81 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Store" } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/promotions/popup:
+    get:
+      tags: [Katalog]
+      summary: Popup promo harga di Beranda
+      description: "`data: null` bila tidak ada promo."
+      parameters:
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data:
+                        type: object
+                        nullable: true
+                        allOf: [{ $ref: "#/components/schemas/PopupDeal" }]
+
+  # ===== Beranda & konten =====
+  /v1/home:
+    get:
+      tags: [Beranda & konten]
+      summary: Isi Beranda 🔒*
+      description: Section dinamis dari tabel `home_sections`. Tanpa token, bagian personal (`user`, `delivery_address`) null.
+      security: [{ apiKey: [] }, { apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: lat, in: query, schema: { type: number } }
+        - { name: lng, in: query, schema: { type: number } }
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Home" }
+  /v1/app-config:
+    get:
+      tags: [Beranda & konten]
+      summary: Konfigurasi app (bisa diubah tanpa update app)
+      description: |
+        Semua key tabel `app_config`. `Cache-Control: max-age=300` + `ETag` (kirim `If-None-Match` → 304).
+        `order_rules` dipakai juga oleh server saat quote (ongkir per jarak, estimasi waktu antar).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data:
+                        type: object
+                        additionalProperties: true
+                        properties:
+                          order_rules: { $ref: "#/components/schemas/OrderRules" }
+        "304": { description: Tidak berubah }
+  /v1/help:
+    get:
+      tags: [Beranda & konten]
+      summary: Pusat Bantuan (topik, FAQ, kontak)
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/HelpCenter" }
+  /v1/legal/{slug}:
+    get:
+      tags: [Beranda & konten]
+      summary: Dokumen legal
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, enum: [privacy-policy, terms] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/LegalDocument" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/promotions/featured:
+    get:
+      tags: [Beranda & konten]
+      summary: Kartu promo langganan 🔒*
+      security: [{ apiKey: [] }, { apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: "`data: null` bila tidak ada promo"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data:
+                        type: object
+                        nullable: true
+                        allOf: [{ $ref: "#/components/schemas/FeaturedPromotion" }]
+  /v1/subscriptions/{plan_id}/activate:
+    post:
+      tags: [Beranda & konten]
+      summary: Aktifkan paket langganan 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: plan_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201":
+          description: Aktif
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/FeaturedPromotion" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ===== Pesanan =====
+  /v1/orders/quote:
+    post:
+      tags: [Pesanan]
+      summary: Hitung harga keranjang 🔒
+      description: |
+        Tidak menyimpan apa pun. Ongkir per jarak alamat → outlet (`order_rules`): tarif dasar sampai `delivery_base_km`,
+        lalu + `delivery_fee_per_km` per km, maks. `delivery_fee_max`. Tanpa alamat / alamat tanpa koordinat → tarif dasar,
+        `distance_km` & `eta_*` null.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuoteRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Quote" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/QuoteRejected" }
+  /v1/orders:
+    get:
+      tags: [Pesanan]
+      summary: Riwayat pesanan 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          description: Dipisah koma
+          schema: { type: string, example: "PENDING,PROCESSING" }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: sort, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/OrderSummary" } }
+                      meta: { $ref: "#/components/schemas/Meta" }
+    post:
+      tags: [Pesanan]
+      summary: Buat pesanan COD 🔒
+      description: |
+        Versi lama dari `/v1/checkout`. Saat Midtrans aktif, metode online → 422 `PAYMENT_REQUIRED`.
+        `Idempotency-Key` yang sama mengembalikan pesanan yang sama.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "201":
+          description: Pesanan dibuat
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/QuoteRejected" }
+  /v1/orders/{id}:
+    get:
+      tags: [Pesanan]
+      summary: Detail pesanan 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/orders/{id}/cancel:
+    post:
+      tags: [Pesanan]
+      summary: Batalkan pesanan (hanya PENDING) 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: Dibatalkan
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/orders/{id}/rating:
+    post:
+      tags: [Pesanan]
+      summary: Beri nilai pesanan selesai 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Order" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  # ===== Pembayaran =====
+  /v1/checkout:
+    post:
+      tags: [Pembayaran]
+      summary: Checkout 🔒
+      description: |
+        COD → pesanan langsung (`next: ORDER`, 201). Bayar Online → sesi Midtrans (`next: PAYMENT`, 201); pesanan dibuat
+        setelah lunas. `Idempotency-Key` sama + isi sama → sesi yang sama (200); isi beda → 409 `IDEMPOTENCY_CONFLICT`.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateOrderRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Checkout" }
+        "201": { $ref: "#/components/responses/Checkout" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/QuoteRejected" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+  /v1/payments:
+    get:
+      tags: [Pembayaran]
+      summary: Sesi pembayaran milik user 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, example: PENDING } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Payment" } }
+  /v1/payments/{id}:
+    get:
+      tags: [Pembayaran]
+      summary: Status sesi pembayaran 🔒
+      description: Bila PENDING, server ikut cek GET Status ke Midtrans (paling sering tiap 5 detik).
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/PaymentOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/payments/{id}/cancel:
+    post:
+      tags: [Pembayaran]
+      summary: Batalkan sesi PENDING 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/PaymentOne" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/payments/midtrans/notification:
+    post:
+      tags: [Pembayaran]
+      summary: Webhook Midtrans (tanpa X-API-Key)
+      description: Divalidasi `signature_key = SHA512(order_id + status_code + gross_amount + server key)`, lalu dikonfirmasi ke GET Status.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                order_id: { type: string }
+                transaction_status: { type: string }
+                status_code: { type: string }
+                gross_amount: { type: string }
+                signature_key: { type: string }
+      responses:
+        "200": { description: Diterima }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/payments/finish:
+    get:
+      tags: [Pembayaran]
+      summary: Finish URL Snap (halaman HTML kecil)
+      security: []
+      parameters:
+        - { name: order_id, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: HTML "Kembali ke aplikasi"
+          content:
+            text/html: {}
+
+  # ===== Profil =====
+  /v1/me:
+    get:
+      tags: [Profil]
+      summary: Profil 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Profile" }
+    patch:
+      tags: [Profil]
+      summary: Ubah profil 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                phone: { type: string, maxLength: 20, example: "081234567890" }
+                avatar_url: { type: string, format: uri, description: harus https }
+      responses:
+        "200": { $ref: "#/components/responses/Profile" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/me/addresses:
+    get:
+      tags: [Profil]
+      summary: Alamat pengiriman 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Address" } }
+    post:
+      tags: [Profil]
+      summary: Tambah alamat 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/AddressInput" }
+                - required: [label, recipient, phone, address]
+      responses:
+        "201": { $ref: "#/components/responses/AddressOne" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/me/addresses/{id}:
+    patch:
+      tags: [Profil]
+      summary: Ubah alamat (field yang dikirim saja) 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddressInput" }
+      responses:
+        "200": { $ref: "#/components/responses/AddressOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Profil]
+      summary: Hapus alamat 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/me/favorites:
+    get:
+      tags: [Profil]
+      summary: Menu favorit 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Product" } }
+  /v1/me/favorites/{product_id}:
+    put:
+      tags: [Profil]
+      summary: Tandai favorit 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/ProductId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Profil]
+      summary: Hapus dari favorit 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/ProductId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /v1/me/vouchers:
+    get:
+      tags: [Profil]
+      summary: Voucher milik user 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Voucher" } }
+  /v1/me/payment-methods:
+    get:
+      tags: [Profil]
+      summary: Metode pembayaran 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/PaymentMethods" }
+    post:
+      tags: [Profil]
+      summary: Tautkan e-wallet 🔒
+      description: 409 `PAYMENT_METHOD_EXISTS`. Tidak bisa saat Midtrans aktif.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, account_number]
+              properties:
+                provider: { type: string, example: GOPAY }
+                account_number: { type: string, maxLength: 20 }
+                account_name: { type: string, maxLength: 100 }
+                set_default: { type: boolean }
+      responses:
+        "201": { $ref: "#/components/responses/PaymentMethods" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/me/payment-methods/default:
+    put:
+      tags: [Profil]
+      summary: Pilih metode utama 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: '"COD" | "QRIS" | "ONLINE" | uuid e-wallet' }
+      responses:
+        "200": { $ref: "#/components/responses/PaymentMethods" }
+  /v1/me/payment-methods/{id}:
+    delete:
+      tags: [Profil]
+      summary: Hapus e-wallet 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/PaymentMethods" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ===== Notifikasi =====
+  /v1/me/devices:
+    put:
+      tags: [Notifikasi]
+      summary: Daftarkan device token APNs 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, bundle_id, environment]
+              properties:
+                token: { type: string }
+                bundle_id: { type: string, example: com.trytuist.app }
+                environment: { type: string, enum: [sandbox, production] }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /v1/devices/unregister:
+    post:
+      tags: [Notifikasi]
+      summary: Berhenti menerima push (tanpa login)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+
+  # ===== Dev =====
+  /v1/dev/orders/{id}/status:
+    post:
+      tags: [Dev]
+      summary: Simulasi status pesanan oleh outlet/kurir 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [PAID, PROCESSING, DELIVERING, COMPLETED, CANCELLED, FAILED] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Order" }
+  /v1/dev/push-test:
+    post:
+      tags: [Dev]
+      summary: Kirim push percobaan ke device user 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+  /v1/dev/payments/{id}/simulate:
+    post:
+      tags: [Dev]
+      summary: Simulasi status Midtrans tanpa simulator 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [settlement, deny, expire, cancel] }
+                payment_type: { type: string, example: gopay }
+      responses:
+        "200": { $ref: "#/components/responses/PaymentOne" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  # ===== Admin =====
+  /v1/admin/me:
+    get:
+      tags: [Admin]
+      summary: Akun admin yang sedang login
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          id: { type: string }
+                          name: { type: string }
+                          email: { type: string }
+                          role: { type: string, enum: [SUPER_ADMIN, OUTLET_ADMIN] }
+                          store_id: { type: string, nullable: true }
+                          store_name: { type: string, nullable: true }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Dashboard penjualan & pembelian
+      description: Default 30 hari terakhir, semua outlet.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { $ref: "#/components/schemas/Dashboard" }
+  /v1/admin/orders:
+    get:
+      tags: [Admin]
+      summary: Daftar pesanan
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: status, in: query, description: Dipisah koma, schema: { type: string } }
+        - { name: q, in: query, description: "Nomor pesanan, nama, atau email", schema: { type: string } }
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/StoreId" }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminOrderSummary" } }
+                      meta: { $ref: "#/components/schemas/Meta" }
+  /v1/admin/orders/{id}:
+    get:
+      tags: [Admin]
+      summary: Detail pesanan
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/AdminOrderOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/admin/orders/{id}/status:
+    patch:
+      tags: [Admin]
+      summary: Ubah status pesanan
+      description: Gagal (`FAILED`) & batal (`CANCELLED`) wajib `note`.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: "#/components/schemas/OrderStatus" }
+                note: { type: string, maxLength: 300 }
+      responses:
+        "200": { $ref: "#/components/responses/AdminOrderOne" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+  /v1/admin/products:
+    get:
+      tags: [Admin]
+      summary: Daftar menu (termasuk yang habis)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: category_id, in: query, schema: { type: string } }
+        - { name: available, in: query, schema: { type: boolean } }
+        - { $ref: "#/components/parameters/StoreId" }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminProduct" } }
+                      meta: { $ref: "#/components/schemas/Meta" }
+    post:
+      tags: [Admin]
+      summary: Tambah menu
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProductInput" }
+      responses:
+        "201": { $ref: "#/components/responses/AdminProductOne" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/admin/products/{id}:
+    get:
+      tags: [Admin]
+      summary: Detail menu
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+        - { $ref: "#/components/parameters/StoreId" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminProductOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Admin]
+      summary: Ubah menu (harga, stok pusat, varian, …)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProductInput" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminProductOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/admin/deals:
+    get:
+      tags: [Admin]
+      summary: Promo harga (berjalan & terjadwal dulu)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/StoreId" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Deal" } }
+    post:
+      tags: [Admin]
+      summary: Buat promo
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DealInput" }
+      responses:
+        "201": { $ref: "#/components/responses/DealOne" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+  /v1/admin/deals/{id}:
+    patch:
+      tags: [Admin]
+      summary: Ubah promo
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DealInput" }
+      responses:
+        "200": { $ref: "#/components/responses/DealOne" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      tags: [Admin]
+      summary: Hapus promo
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/admin/stores:
+    get:
+      tags: [Admin]
+      summary: Outlet (termasuk nonaktif) + ringkasan hari ini
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminStore" } }
+    post:
+      tags: [Admin (super)]
+      summary: Tambah outlet
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StoreInput" }
+      responses:
+        "201": { $ref: "#/components/responses/AdminStoreOne" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/admin/stores/{id}:
+    patch:
+      tags: [Admin]
+      summary: Ubah outlet (jam buka, radius, tutup sementara)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StoreInput" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminStoreOne" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/admin/stores/{id}/products/{product_id}:
+    put:
+      tags: [Admin]
+      summary: Menu, stok & harga per outlet
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Id" }
+        - { $ref: "#/components/parameters/ProductId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                is_listed: { type: boolean, description: "false = berhenti menjual di outlet ini" }
+                is_available: { type: boolean, description: "false = ditandai habis" }
+                stock: { type: integer, nullable: true, description: "null = tidak dihitung" }
+                price: { type: integer, nullable: true, description: "null = harga pusat" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminProductOne" }
+  /v1/admin/categories:
+    get:
+      tags: [Admin]
+      summary: Kategori (termasuk nonaktif)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminCategory" } }
+    post:
+      tags: [Admin (super)]
+      summary: Tambah kategori
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CategoryInput" }
+      responses:
+        "201": { $ref: "#/components/responses/AdminCategoryOne" }
+  /v1/admin/categories/{id}:
+    patch:
+      tags: [Admin (super)]
+      summary: Ubah kategori
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CategoryInput" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminCategoryOne" }
+  /v1/admin/payments:
+    get:
+      tags: [Admin]
+      summary: Pembayaran online (Midtrans)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          description: Dipisah koma
+          schema: { type: string, example: "PAID,PENDING" }
+        - { name: q, in: query, description: "ID Midtrans, nomor pesanan, nama, atau email", schema: { type: string } }
+        - { name: refund, in: query, description: "1 = hanya yang punya refund_status", schema: { type: string, enum: ["1"] } }
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - { $ref: "#/components/parameters/StoreId" }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminPaymentSummary" } }
+                      meta: { $ref: "#/components/schemas/Meta" }
+  /v1/admin/payments/{id}:
+    get:
+      tags: [Admin]
+      summary: Detail pembayaran + refund + event Midtrans
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/AdminPaymentOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/admin/payments/{id}/refund:
+    post:
+      tags: [Admin (super)]
+      summary: Refund penuh / sebagian / manual
+      description: |
+        Status pesanan tidak diubah otomatis. VA & gerai tidak bisa lewat Midtrans → kirim `manual: true`
+        setelah dana ditransfer balik. Error: 409 `PAYMENT_NOT_PAID`, 422 `REFUND_AMOUNT_INVALID` /
+        `REFUND_NOT_SUPPORTED` / `REFUND_REJECTED` / `PAYMENT_METHOD_UNAVAILABLE`, 502 `PAYMENT_GATEWAY_ERROR`.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                amount: { type: integer, minimum: 0, description: "0 / kosong = seluruh sisa", example: 20000 }
+                reason: { type: string, maxLength: 300, example: Menu habis }
+                manual: { type: boolean, default: false }
+      responses:
+        "200": { $ref: "#/components/responses/AdminPaymentOne" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+  /v1/admin/banners:
+    get:
+      tags: [Admin (super)]
+      summary: Semua banner Beranda + status tampil
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminBanner" } }
+    post:
+      tags: [Admin (super)]
+      summary: Buat banner
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BannerInput" }
+      responses:
+        "201": { $ref: "#/components/responses/AdminBannerOne" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/admin/banners/{id}:
+    patch:
+      tags: [Admin (super)]
+      summary: Ubah banner (field yang dikirim saja)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BannerInput" }
+      responses:
+        "200": { $ref: "#/components/responses/AdminBannerOne" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Admin (super)]
+      summary: Hapus banner
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/admin/delivery-settings:
+    get:
+      tags: [Admin (super)]
+      summary: Aturan ongkir per jarak + contoh perhitungan
+      description: Disimpan di `app_config.order_rules`. Contoh dihitung dengan fungsi yang sama dengan quote/checkout.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/DeliverySettings" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [Admin (super)]
+      summary: Ubah aturan ongkir (langsung berlaku)
+      description: Field yang tidak dikirim tidak berubah. `delivery_fee_max` harus ≥ `delivery_fee` atau 0. Tercatat di audit log.
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeliverySettings" }
+      responses:
+        "200": { $ref: "#/components/responses/DeliverySettings" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/admin/delivery-settings/preview:
+    post:
+      tags: [Admin (super)]
+      summary: Hitung contoh dari aturan draf (tidak menyimpan)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/DeliverySettings" }
+                - type: object
+                  properties:
+                    preview_subtotal: { type: integer, description: "Subtotal contoh (cek gratis ongkir); 0 = abaikan" }
+                    preview_distances: { type: array, maxItems: 20, items: { type: number }, example: [2.5, 8] }
+      responses:
+        "200": { $ref: "#/components/responses/DeliverySettings" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/admin/staff:
+    get:
+      tags: [Admin (super)]
+      summary: Akun admin
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/Staff" } }
+    post:
+      tags: [Admin (super)]
+      summary: Tambah akun admin
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StaffInput" }
+      responses:
+        "201": { $ref: "#/components/responses/StaffOne" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/admin/staff/{id}:
+    patch:
+      tags: [Admin (super)]
+      summary: Ubah akun admin (role, outlet, password)
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StaffInput" }
+      responses:
+        "200": { $ref: "#/components/responses/StaffOne" }
+  /v1/admin/customers:
+    get:
+      tags: [Admin (super)]
+      summary: Pelanggan + ringkasan pembelian
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data: { type: array, items: { $ref: "#/components/schemas/AdminCustomer" } }
+                      meta: { $ref: "#/components/schemas/Meta" }
+  /v1/admin/audit-logs:
+    get:
+      tags: [Admin (super)]
+      summary: Audit log aksi admin
+      security: [{ apiKey: [], bearerAuth: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/Limit" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Envelope" }
+                  - properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string }
+                            action: { type: string, example: PAYMENT_REFUND }
+                            entity: { type: string }
+                            entity_id: { type: string }
+                            summary: { type: string }
+                            data: { type: object, additionalProperties: true }
+                            admin_name: { type: string, nullable: true }
+                            created_at: { type: string, format: date-time }
+                      meta: { $ref: "#/components/schemas/Meta" }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string } }
+    ProductId: { name: product_id, in: path, required: true, schema: { type: string, example: P01 } }
+    StoreId: { name: store_id, in: query, description: "Outlet, mis. ST01", schema: { type: string } }
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    From: { name: from, in: query, schema: { type: string, format: date, example: "2026-10-01" } }
+    To: { name: to, in: query, schema: { type: string, format: date, example: "2026-10-19" } }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: UUID dari client; retry dengan key yang sama tidak membuat pesanan / sesi ganda
+      schema: { type: string, format: uuid }
+
+  responses:
+    Ok:
+      description: OK
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Envelope" }
+    Session:
+      description: Sesi login
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Session" }
+    BannerList:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Banner" } }
+    Profile:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Profile" }
+    AddressOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Address" }
+    PaymentMethods:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/PaymentMethodOverview" }
+    Checkout:
+      description: "`next = ORDER` (COD) atau `PAYMENT` (Bayar Online)"
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data:
+                    type: object
+                    properties:
+                      next: { type: string, enum: [ORDER, PAYMENT] }
+                      order: { type: object, allOf: [{ $ref: "#/components/schemas/Order" }], nullable: true }
+                      payment: { type: object, allOf: [{ $ref: "#/components/schemas/Payment" }], nullable: true }
+    PaymentOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Payment" }
+    AdminOrderOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminOrder" }
+    AdminProductOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminProduct" }
+    DealOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Deal" }
+    AdminStoreOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminStore" }
+    AdminCategoryOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminCategory" }
+    StaffOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/Staff" }
+    AdminPaymentOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminPayment" }
+    AdminBannerOne:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data: { $ref: "#/components/schemas/AdminBanner" }
+    DeliverySettings:
+      description: OK
+      content:
+        application/json:
+          schema:
+            allOf:
+              - { $ref: "#/components/schemas/Envelope" }
+              - properties:
+                  data:
+                    type: object
+                    properties:
+                      settings: { $ref: "#/components/schemas/DeliverySettings" }
+                      updated_at: { type: string, format: date-time, nullable: true }
+                      examples:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            distance_km: { type: number, example: 5 }
+                            delivery_fee: { type: integer, example: 14000 }
+                            eta_min_minutes: { type: integer, example: 30 }
+                            eta_max_minutes: { type: integer, example: 40 }
+    BadRequest:
+      description: "`VALIDATION_ERROR` — detail per field di `error.details`"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: "`UNAUTHORIZED` — token tidak ada / kedaluwarsa (panggil `/v1/auth/refresh`)"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: "`FORBIDDEN` / `INVALID_API_KEY` / `INVALID_SIGNATURE`"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: "`NOT_FOUND`"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: Konflik, mis. `EMAIL_ALREADY_REGISTERED`, `IDEMPOTENCY_CONFLICT`, `PAYMENT_ALREADY_FINAL`
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unprocessable:
+      description: Aturan bisnis menolak permintaan (lihat `error.type`)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    QuoteRejected:
+      description: |
+        `EMPTY_CART`, `INVALID_QUANTITY`, `PRODUCT_UNAVAILABLE`, `OUT_OF_STOCK`, `STORE_CLOSED`,
+        `OUT_OF_DELIVERY_AREA`, `INVALID_VOUCHER`, `PAYMENT_REQUIRED`, `PAYMENT_METHOD_UNAVAILABLE`, `AMOUNT_TOO_SMALL`,
+        `FREE_DELIVERY_UNAVAILABLE` (fitur kupon dimatikan), `FREE_DELIVERY_QUOTA_EXCEEDED` (kupon minggu ini habis)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TooManyRequests:
+      description: "`TOO_MANY_REQUESTS`"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    BadGateway:
+      description: "`PAYMENT_GATEWAY_ERROR` — Midtrans gangguan / timeout"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Envelope:
+      type: object
+      properties:
+        code: { type: integer, example: 200 }
+        message: { type: string, example: success }
+    Meta:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+    Error:
+      type: object
+      properties:
+        code: { type: integer, example: 422 }
+        message: { type: string, example: Keranjang masih kosong. }
+        error:
+          type: object
+          properties:
+            type: { type: string, example: EMPTY_CART }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+
+    Session:
+      type: object
+      properties:
+        user_name: { type: string }
+        user_image: { type: string }
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_at: { type: integer, description: Unix detik }
+        is_new_user: { type: boolean }
+    BannerAction:
+      type: object
+      description: "Aksi saat banner di-tap. PRODUCT/CATEGORY: value = id produk/kategori. FREE_DELIVERY: info kupon gratis ongkir mingguan."
+      properties:
+        type: { type: string, enum: [NONE, PRODUCT, CATEGORY, FREE_DELIVERY] }
+        value: { type: string, nullable: true, example: P07 }
+    Banner:
+      type: object
+      description: Hanya banner aktif yang tujuannya berlaku (banner kupon disembunyikan bila kupon dimatikan).
+      properties:
+        id: { type: string }
+        title: { type: string }
+        subtitle: { type: string }
+        image_url: { type: string }
+        action: { $ref: "#/components/schemas/BannerAction" }
+    AdminBanner:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        subtitle: { type: string }
+        image_url: { type: string }
+        action_type: { type: string, enum: [NONE, PRODUCT, CATEGORY, FREE_DELIVERY] }
+        action_value: { type: string, nullable: true }
+        action_label: { type: string, nullable: true, description: Nama produk / kategori tujuan }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+        status: { type: string, enum: [LIVE, SCHEDULED, ENDED, INACTIVE, HIDDEN], description: "HIDDEN = dalam periode tapi tujuan tidak berlaku" }
+        updated_at: { type: string, format: date-time }
+    BannerInput:
+      type: object
+      properties:
+        title: { type: string, maxLength: 80 }
+        subtitle: { type: string, maxLength: 120 }
+        image_url: { type: string, description: "https://…" }
+        action_type: { type: string, enum: [NONE, PRODUCT, CATEGORY, FREE_DELIVERY] }
+        action_value: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        clear_schedule: { type: boolean, description: true = tampil tanpa batas waktu }
+        sort_order: { type: integer, minimum: 0 }
+        is_active: { type: boolean }
+    Category:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        icon: { type: string }
+    CategoryListEnvelope:
+      allOf:
+        - { $ref: "#/components/schemas/Envelope" }
+        - properties:
+            data: { type: array, items: { $ref: "#/components/schemas/Category" } }
+    ProductOption:
+      type: object
+      properties:
+        id: { type: string, example: large }
+        name: { type: string, example: Large }
+        extra_price: { type: integer, example: 5000 }
+    Product:
+      type: object
+      properties:
+        product_id: { type: string, example: P01 }
+        product_name: { type: string, example: Es Kopi Susu Gula Aren }
+        description: { type: string }
+        category_id: { type: string }
+        price: { type: integer, description: Harga berlaku (sudah termasuk promo), example: 22000 }
+        original_price: { type: integer, nullable: true, description: Harga normal bila sedang promo }
+        discount_percent: { type: integer }
+        image_url: { type: string }
+        rating: { type: number }
+        sold_count: { type: integer }
+        is_available: { type: boolean }
+        tags: { type: array, items: { type: string } }
+        options: { type: array, items: { $ref: "#/components/schemas/ProductOption" } }
+        combo:
+          type: object
+          nullable: true
+          description: "Paket isi tetap. Habis bila salah satu isinya habis di outlet; stok isi ikut terpotong."
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/BundleItem" } }
+            separate_price: { type: integer, description: Total bila isinya dibeli satuan, example: 48000 }
+            savings: { type: integer, example: 9000 }
+    BundleItem:
+      type: object
+      properties:
+        product_id: { type: string }
+        product_name: { type: string }
+        option_id: { type: string, nullable: true }
+        option_name: { type: string, nullable: true }
+        quantity: { type: integer, description: Per 1 paket }
+    ProductEnvelope:
+      allOf:
+        - { $ref: "#/components/schemas/Envelope" }
+        - properties:
+            data: { $ref: "#/components/schemas/Product" }
+    ProductListEnvelope:
+      allOf:
+        - { $ref: "#/components/schemas/Envelope" }
+        - properties:
+            data: { type: array, items: { $ref: "#/components/schemas/Product" } }
+            meta: { $ref: "#/components/schemas/Meta" }
+    PopupDeal:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        subtitle: { type: string }
+        badge: { type: string }
+        image_url: { type: string }
+        ends_at: { type: string, format: date-time }
+        product: { $ref: "#/components/schemas/Product" }
+    Store:
+      type: object
+      properties:
+        id: { type: string, example: ST01 }
+        name: { type: string, example: Gandaria City }
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        phone: { type: string, nullable: true }
+        is_open: { type: boolean }
+        opens_at: { type: string, example: "08:00" }
+        closes_at: { type: string, example: "22:00" }
+        hours_label: { type: string, example: "08:00–22:00" }
+        delivery_radius_km: { type: number }
+        distance_km: { type: number, nullable: true }
+        is_deliverable: { type: boolean, nullable: true }
+        closed_note: { type: string, nullable: true }
+    Home:
+      type: object
+      properties:
+        greeting: { type: string, example: Selamat pagi }
+        user:
+          type: object
+          nullable: true
+          properties:
+            name: { type: string }
+            points: { type: integer }
+            voucher_count: { type: integer }
+        delivery_address:
+          type: object
+          nullable: true
+          properties:
+            id: { type: string }
+            label: { type: string }
+            address: { type: string }
+        store:
+          type: object
+          nullable: true
+          properties:
+            id: { type: string }
+            name: { type: string }
+            is_open: { type: boolean }
+            hours_label: { type: string }
+            closed_note: { type: string, nullable: true }
+        sections:
+          type: array
+          description: Bentuk per `type` (banner, kategori, produk, …) — lihat API_PLAN §5.18
+          items: { type: object, additionalProperties: true }
+    OrderRules:
+      type: object
+      properties:
+        min_quantity: { type: integer, example: 1 }
+        max_quantity: { type: integer, example: 20 }
+        max_note_length: { type: integer, example: 100 }
+        delivery_fee: { type: integer, description: Tarif dasar, example: 10000 }
+        free_delivery_min_subtotal: { type: integer, description: 0 = nonaktif }
+        delivery_base_km: { type: number, example: 3 }
+        delivery_fee_per_km: { type: integer, description: 0 = ongkir flat, example: 2000 }
+        delivery_fee_max: { type: integer, description: 0 = tanpa batas, example: 30000 }
+        prep_minutes: { type: integer, example: 15 }
+        courier_speed_kmh: { type: number, example: 20 }
+        free_delivery_coupon_enabled: { type: boolean }
+        free_delivery_coupon_weekly: { type: integer, example: 2 }
+    HelpCenter:
+      type: object
+      properties:
+        query: { type: string, nullable: true }
+        operating_hours: { type: string }
+        topics:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+              icon: { type: string }
+              articles:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    question: { type: string }
+                    answer: { type: string }
+                    updated_at: { type: string, format: date-time }
+        contacts:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [WHATSAPP, EMAIL, PHONE] }
+              label: { type: string }
+              value: { type: string }
+              icon: { type: string }
+              url: { type: string }
+    LegalDocument:
+      type: object
+      properties:
+        slug: { type: string }
+        title: { type: string }
+        version: { type: string }
+        summary: { type: string, nullable: true }
+        sections:
+          type: array
+          items:
+            type: object
+            properties:
+              heading: { type: string }
+              body: { type: string }
+        effective_at: { type: string, format: date }
+        updated_at: { type: string, format: date-time }
+    FeaturedPromotion:
+      type: object
+      properties:
+        plan_id: { type: string }
+        eyebrow: { type: string }
+        title: { type: string }
+        price: { type: integer }
+        period: { type: string, enum: [DAILY, WEEKLY, MONTHLY] }
+        image_url: { type: string, nullable: true }
+        is_active: { type: boolean }
+        active_until: { type: string, format: date-time, nullable: true }
+
+    DeliverySettings:
+      type: object
+      properties:
+        delivery_fee: { type: integer, minimum: 0, description: Tarif dasar, example: 10000 }
+        delivery_base_km: { type: number, minimum: 0, maximum: 50, description: Jarak yang tercakup tarif dasar, example: 3 }
+        delivery_fee_per_km: { type: integer, minimum: 0, description: "Per km berikutnya (dibulatkan ke atas); 0 = flat", example: 2000 }
+        delivery_fee_max: { type: integer, minimum: 0, description: "0 = tanpa batas", example: 30000 }
+        free_delivery_min_subtotal: { type: integer, minimum: 0, description: "Gratis ongkir bila subtotal ≥ nilai ini; 0 = nonaktif" }
+        prep_minutes: { type: integer, minimum: 0, maximum: 240, example: 15 }
+        courier_speed_kmh: { type: number, exclusiveMinimum: true, minimum: 0, maximum: 120, example: 20 }
+        free_delivery_coupon_enabled: { type: boolean, description: Fitur kupon gratis ongkir mingguan }
+        free_delivery_coupon_weekly: { type: integer, minimum: 1, maximum: 14, example: 2 }
+    OrderItemInput:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id: { type: string, example: P01 }
+        option_id: { type: string, nullable: true, example: large }
+        quantity: { type: integer, example: 2 }
+        note: { type: string, maxLength: 100, example: less sugar }
+    QuoteRequest:
+      type: object
+      required: [items]
+      properties:
+        store_id: { type: string, description: Kosong = outlet buka terdekat yang menjangkau alamat }
+        address_id: { type: string, format: uuid }
+        voucher_code: { type: string, example: HEMAT10 }
+        items: { type: array, maxItems: 50, items: { $ref: "#/components/schemas/OrderItemInput" } }
+        use_free_delivery:
+          type: boolean
+          description: "Pakai kupon gratis ongkir mingguan (kuota per user per minggu, reset Senin 00:00 WIB). Tidak terpakai bila ongkir sudah 0."
+    CreateOrderRequest:
+      allOf:
+        - { $ref: "#/components/schemas/QuoteRequest" }
+        - type: object
+          properties:
+            payment_method: { type: string, enum: [COD, QRIS, EWALLET, ONLINE] }
+            payment_method_id: { type: string, description: '"COD" | "QRIS" | "ONLINE" | uuid e-wallet; kosong = metode utama user' }
+            note: { type: string, maxLength: 255 }
+    OrderLine:
+      type: object
+      properties:
+        product_id: { type: string }
+        product_name: { type: string }
+        option_id: { type: string, nullable: true }
+        option_name: { type: string, nullable: true }
+        unit_price: { type: integer }
+        quantity: { type: integer }
+        note: { type: string }
+        subtotal: { type: integer }
+        bundle_items: { type: array, items: { $ref: "#/components/schemas/BundleItem" }, description: "Isi combo (snapshot); tidak ada untuk produk biasa" }
+    Quote:
+      type: object
+      properties:
+        store_id: { type: string }
+        store_name: { type: string }
+        items: { type: array, items: { $ref: "#/components/schemas/OrderLine" } }
+        subtotal: { type: integer, example: 44000 }
+        delivery_fee: { type: integer, example: 12000 }
+        discount: { type: integer, example: 0 }
+        total: { type: integer, example: 56000 }
+        voucher_code: { type: string, nullable: true }
+        distance_km: { type: number, nullable: true, example: 4.2 }
+        eta_min_minutes: { type: integer, nullable: true, example: 30 }
+        eta_max_minutes: { type: integer, nullable: true, example: 40 }
+        free_delivery:
+          type: object
+          nullable: true
+          properties:
+            enabled: { type: boolean }
+            weekly_quota: { type: integer, example: 2 }
+            used: { type: integer, description: Terpakai minggu ini (belum termasuk quote ini) }
+            remaining: { type: integer, description: "Sisa setelah pesanan ini (bila applied)" }
+            resets_at: { type: string, format: date-time, description: Senin berikutnya 00:00 WIB }
+            applied: { type: boolean }
+            fee_waived: { type: integer, description: Ongkir yang digratiskan }
+    OrderStatus:
+      type: string
+      enum: [PENDING, PAID, PROCESSING, DELIVERING, COMPLETED, CANCELLED, FAILED]
+    OrderSummary:
+      type: object
+      properties:
+        order_id: { type: string }
+        order_number: { type: string, example: ORD-20261019-0001 }
+        store_name: { type: string }
+        product_name: { type: string, example: Es Kopi Susu +1 lainnya }
+        created_at: { type: string, format: date-time }
+        total_price: { type: integer }
+        qty: { type: integer }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        can_rate: { type: boolean }
+        rating: { type: integer, nullable: true }
+    Order:
+      type: object
+      properties:
+        order_id: { type: string }
+        order_number: { type: string }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        subtotal: { type: integer }
+        delivery_fee: { type: integer }
+        discount: { type: integer }
+        total: { type: integer }
+        payment_method: { type: string, enum: [COD, QRIS, EWALLET, ONLINE] }
+        payment_method_id: { type: string, nullable: true }
+        payment_provider: { type: string, nullable: true }
+        payment_account_masked: { type: string, nullable: true }
+        note: { type: string, nullable: true }
+        voucher_code: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        items: { type: array, items: { $ref: "#/components/schemas/OrderLine" } }
+        store:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            address: { type: string }
+        address: { type: object, allOf: [{ $ref: "#/components/schemas/Address" }], nullable: true }
+        status_history:
+          type: array
+          items:
+            type: object
+            properties:
+              status: { $ref: "#/components/schemas/OrderStatus" }
+              at: { type: string, format: date-time }
+              note: { type: string }
+        rating:
+          type: object
+          nullable: true
+          properties:
+            rating: { type: integer }
+            comment: { type: string, nullable: true }
+            created_at: { type: string, format: date-time }
+        can_cancel: { type: boolean }
+        can_rate: { type: boolean }
+        distance_km: { type: number, nullable: true }
+        eta_min_minutes: { type: integer, nullable: true }
+        eta_max_minutes: { type: integer, nullable: true }
+        free_delivery_coupon: { type: boolean }
+        delivery_fee_waived: { type: integer, description: Ongkir yang ditanggung toko karena kupon }
+        refund:
+          type: object
+          nullable: true
+          description: "Pengembalian dana pesanan Bayar Online. PENDING = batal/gagal, menunggu toko mengembalikan dana"
+          properties:
+            status: { type: string, enum: [PENDING, PARTIAL, COMPLETED] }
+            amount: { type: integer, description: Sudah dikembalikan }
+    PaymentStatus:
+      type: string
+      enum: [PENDING, PAID, FAILED, EXPIRED, CANCELLED]
+    Payment:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { type: string, example: MIDTRANS }
+        provider_order_id: { type: string, example: TT-DEV-20261019-7K3QX9PA }
+        status: { $ref: "#/components/schemas/PaymentStatus" }
+        amount: { type: integer }
+        expires_at: { type: string, format: date-time }
+        redirect_url: { type: string, nullable: true, description: Halaman Snap; null setelah status final }
+        finish_url_prefix: { type: string }
+        payment_type: { type: string, nullable: true, example: gopay }
+        paid_at: { type: string, format: date-time, nullable: true }
+        status_message: { type: string, nullable: true }
+        refund_status:
+          type: string
+          nullable: true
+          enum: [REFUND, PARTIAL_REFUND, CHARGEBACK, PARTIAL_CHARGEBACK, REVERSED, REQUIRED]
+        store:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+        quote: { $ref: "#/components/schemas/Quote" }
+        order: { type: object, allOf: [{ $ref: "#/components/schemas/OrderRef" }], nullable: true }
+        created_at: { type: string, format: date-time }
+    OrderRef:
+      type: object
+      properties:
+        id: { type: string }
+        order_number: { type: string }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+
+    Profile:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string }
+        phone: { type: string, nullable: true }
+        avatar_url: { type: string, nullable: true }
+        member_tier: { type: string }
+        points: { type: integer }
+        voucher_count: { type: integer }
+        balance: { type: integer }
+    AddressInput:
+      type: object
+      properties:
+        label: { type: string, maxLength: 50, example: Rumah }
+        recipient: { type: string, maxLength: 100 }
+        phone: { type: string, maxLength: 20 }
+        address: { type: string, maxLength: 500 }
+        notes: { type: string, maxLength: 500, nullable: true }
+        lat: { type: number, minimum: -90, maximum: 90, nullable: true, description: Dipakai untuk ongkir per jarak }
+        lng: { type: number, minimum: -180, maximum: 180, nullable: true }
+        is_default: { type: boolean }
+    Address:
+      allOf:
+        - { $ref: "#/components/schemas/AddressInput" }
+        - type: object
+          properties:
+            id: { type: string }
+    Voucher:
+      type: object
+      properties:
+        code: { type: string }
+        title: { type: string }
+        description: { type: string }
+        discount_type: { type: string, enum: [PERCENT, FIXED] }
+        discount_value: { type: integer }
+        min_subtotal: { type: integer }
+        max_discount: { type: integer, nullable: true }
+        ends_at: { type: string, format: date-time }
+    PaymentMethodOverview:
+      type: object
+      properties:
+        default_id: { type: string, example: ONLINE }
+        can_add_ewallet: { type: boolean }
+        methods:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              type: { type: string, enum: [COD, QRIS, EWALLET, ONLINE] }
+              provider: { type: string, nullable: true }
+              name: { type: string }
+              description: { type: string, nullable: true }
+              icon: { type: string }
+              account_masked: { type: string, nullable: true }
+              account_name: { type: string, nullable: true }
+              is_enabled: { type: boolean }
+              is_default: { type: boolean }
+              is_removable: { type: boolean }
+        ewallet_providers:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              icon: { type: string }
+              tint: { type: string }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string }
+        phone: { type: string, nullable: true }
+    Dashboard:
+      type: object
+      description: Detail field di API_PLAN §5.25
+      properties:
+        range: { type: object, properties: { from: { type: string }, to: { type: string } } }
+        sales: { type: object, additionalProperties: true }
+        purchases: { type: object, additionalProperties: true }
+        daily: { type: array, items: { type: object, additionalProperties: true } }
+        by_status: { type: array, items: { type: object, additionalProperties: true } }
+        top_products: { type: array, items: { type: object, additionalProperties: true } }
+        payment_methods: { type: array, items: { type: object, additionalProperties: true } }
+        store_id: { type: string, nullable: true }
+        by_store: { type: array, items: { type: object, additionalProperties: true } }
+    AdminOrderSummary:
+      type: object
+      properties:
+        order_id: { type: string }
+        order_number: { type: string }
+        status: { $ref: "#/components/schemas/OrderStatus" }
+        total: { type: integer }
+        payment_method: { type: string }
+        item_summary: { type: string }
+        qty: { type: integer }
+        store_id: { type: string }
+        store_name: { type: string }
+        customer: { $ref: "#/components/schemas/Customer" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    AdminOrder:
+      allOf:
+        - { $ref: "#/components/schemas/Order" }
+        - type: object
+          properties:
+            customer: { $ref: "#/components/schemas/Customer" }
+            next_statuses: { type: array, items: { $ref: "#/components/schemas/OrderStatus" } }
+            payment:
+              type: object
+              nullable: true
+              description: null untuk COD
+              properties:
+                id: { type: string }
+                provider_order_id: { type: string }
+                status: { $ref: "#/components/schemas/PaymentStatus" }
+                payment_type: { type: string, nullable: true }
+                refund_status: { type: string, nullable: true }
+                paid_at: { type: string, format: date-time, nullable: true }
+    AdminProduct:
+      type: object
+      properties:
+        product_id: { type: string }
+        product_name: { type: string }
+        description: { type: string }
+        category_id: { type: string }
+        category_name: { type: string }
+        price: { type: integer, description: Harga normal }
+        deal_price: { type: integer, nullable: true }
+        effective_price: { type: integer }
+        image_url: { type: string }
+        rating: { type: number }
+        sold_count: { type: integer }
+        is_available: { type: boolean }
+        is_best_seller: { type: boolean }
+        options: { type: array, items: { $ref: "#/components/schemas/ProductOption" } }
+        updated_at: { type: string, format: date-time }
+        bundle_items:
+          type: array
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/BundleItem" }
+              - type: object
+                properties:
+                  unit_price: { type: integer, description: Harga pusat + varian }
+        separate_price: { type: integer }
+        store:
+          type: object
+          description: Hanya bila `store_id` dikirim
+          properties:
+            store_id: { type: string }
+            is_listed: { type: boolean }
+            is_sold_out: { type: boolean }
+            stock: { type: integer, nullable: true }
+            price: { type: integer, nullable: true }
+            deal_price: { type: integer, nullable: true }
+            effective_price: { type: integer }
+            is_available: { type: boolean }
+    ProductInput:
+      type: object
+      properties:
+        category_id: { type: string }
+        product_name: { type: string, maxLength: 100 }
+        description: { type: string, maxLength: 500 }
+        price: { type: integer, minimum: 0 }
+        image_url: { type: string }
+        is_available: { type: boolean }
+        is_best_seller: { type: boolean }
+        options:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            properties:
+              id: { type: string, description: Kosong = varian baru }
+              name: { type: string }
+              extra_price: { type: integer, minimum: 0 }
+        bundle_items:
+          type: array
+          nullable: true
+          maxItems: 10
+          description: "Isi combo. null = tidak diubah, [] = jadikan produk biasa. Isi tidak boleh paket lain / dirinya sendiri."
+          items:
+            type: object
+            required: [product_id, quantity]
+            properties:
+              product_id: { type: string }
+              option_id: { type: string, nullable: true }
+              quantity: { type: integer, minimum: 1, maximum: 10 }
+    Deal:
+      type: object
+      properties:
+        id: { type: string }
+        product_id: { type: string }
+        product_name: { type: string }
+        product_price: { type: integer }
+        title: { type: string }
+        subtitle: { type: string }
+        badge: { type: string }
+        image_url: { type: string, nullable: true }
+        deal_price: { type: integer }
+        discount_percent: { type: integer }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        is_active: { type: boolean }
+        show_as_popup: { type: boolean }
+        sort_order: { type: integer }
+        status: { type: string }
+        store_id: { type: string, nullable: true, description: null = semua outlet }
+        store_name: { type: string, nullable: true }
+        can_edit: { type: boolean }
+    DealInput:
+      type: object
+      properties:
+        product_id: { type: string }
+        title: { type: string, maxLength: 120 }
+        subtitle: { type: string, maxLength: 200 }
+        badge: { type: string, maxLength: 30 }
+        image_url: { type: string }
+        deal_price: { type: integer, minimum: 1 }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        is_active: { type: boolean }
+        show_as_popup: { type: boolean }
+        sort_order: { type: integer }
+        store_id: { type: string, nullable: true }
+    AdminStore:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        phone: { type: string, nullable: true }
+        opens_at: { type: string }
+        closes_at: { type: string }
+        hours_label: { type: string }
+        delivery_radius_km: { type: number }
+        is_active: { type: boolean }
+        is_temporarily_closed: { type: boolean }
+        is_open_now: { type: boolean }
+        sort_order: { type: integer }
+        unavailable_products: { type: integer }
+        listed_products: { type: integer }
+        today:
+          type: object
+          properties:
+            orders: { type: integer }
+            revenue: { type: integer }
+            active: { type: integer }
+    StoreInput:
+      type: object
+      properties:
+        name: { type: string, maxLength: 80 }
+        address: { type: string, maxLength: 300 }
+        lat: { type: number }
+        lng: { type: number }
+        phone: { type: string }
+        opens_at: { type: string, example: "08:00", description: "opens_at = closes_at → 24 jam" }
+        closes_at: { type: string, example: "22:00" }
+        delivery_radius_km: { type: number, maximum: 50 }
+        is_active: { type: boolean }
+        is_temporarily_closed: { type: boolean }
+        sort_order: { type: integer }
+    AdminCategory:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        icon: { type: string }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+        product_count: { type: integer }
+    CategoryInput:
+      type: object
+      properties:
+        id: { type: string, description: Kosong = dibuat dari nama }
+        name: { type: string, maxLength: 50 }
+        icon: { type: string, maxLength: 16 }
+        sort_order: { type: integer }
+        is_active: { type: boolean }
+    Staff:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [SUPER_ADMIN, OUTLET_ADMIN] }
+        store_id: { type: string, nullable: true }
+        store_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+    StaffInput:
+      type: object
+      properties:
+        name: { type: string }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+        role: { type: string, enum: [SUPER_ADMIN, OUTLET_ADMIN, CUSTOMER] }
+        store_id: { type: string, description: Wajib untuk OUTLET_ADMIN }
+    AdminCustomer:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string }
+        phone: { type: string, nullable: true }
+        role: { type: string }
+        member_tier: { type: string }
+        orders_count: { type: integer }
+        total_spent: { type: integer }
+        last_order_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+    AdminPaymentSummary:
+      type: object
+      properties:
+        id: { type: string }
+        provider_order_id: { type: string }
+        status: { $ref: "#/components/schemas/PaymentStatus" }
+        amount: { type: integer }
+        refunded_amount: { type: integer }
+        refund_status: { type: string, nullable: true }
+        payment_type: { type: string, nullable: true }
+        store_id: { type: string }
+        store_name: { type: string }
+        customer: { $ref: "#/components/schemas/Customer" }
+        order: { type: object, allOf: [{ $ref: "#/components/schemas/OrderRef" }], nullable: true }
+        created_at: { type: string, format: date-time }
+        paid_at: { type: string, format: date-time, nullable: true }
+        expires_at: { type: string, format: date-time }
+    AdminPayment:
+      allOf:
+        - { $ref: "#/components/schemas/Payment" }
+        - type: object
+          properties:
+            provider_txn_id: { type: string, nullable: true }
+            customer: { $ref: "#/components/schemas/Customer" }
+            refunded_amount: { type: integer }
+            refundable_amount: { type: integer }
+            can_refund_online: { type: boolean, description: "false = VA / gerai, hanya refund manual" }
+            refunds:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  amount: { type: integer }
+                  reason: { type: string }
+                  method: { type: string, enum: [MIDTRANS, MANUAL] }
+                  status: { type: string, enum: [PENDING, SUCCEEDED, FAILED] }
+                  message: { type: string, nullable: true }
+                  admin_name: { type: string, nullable: true }
+                  created_at: { type: string, format: date-time }
+            events:
+              type: array
+              items:
+                type: object
+                properties:
+                  source: { type: string, enum: [webhook, status_api, client, sweeper] }
+                  provider_status: { type: string, nullable: true }
+                  signature_ok: { type: boolean, nullable: true }
+                  payload: { type: object, additionalProperties: true }
+                  created_at: { type: string, format: date-time }

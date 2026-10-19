@@ -9,11 +9,17 @@ import (
 // DTO JSON — nama field sama persis dengan DTO di iOS (lihat API_PLAN.md §5).
 
 type BannerDTO struct {
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Subtitle string  `json:"subtitle"`
-	ImageURL string  `json:"image_url"`
-	Deeplink *string `json:"deeplink,omitempty"`
+	ID       string          `json:"id"`
+	Title    string          `json:"title"`
+	Subtitle string          `json:"subtitle"`
+	ImageURL string          `json:"image_url"`
+	Action   BannerActionDTO `json:"action"`
+}
+
+// BannerActionDTO: type NONE | PRODUCT | CATEGORY | FREE_DELIVERY; value = id produk/kategori.
+type BannerActionDTO struct {
+	Type  string  `json:"type"`
+	Value *string `json:"value"`
 }
 
 type CategoryDTO struct {
@@ -43,12 +49,29 @@ type ProductDTO struct {
 	IsAvailable     bool        `json:"is_available"`
 	Tags            []string    `json:"tags"`
 	Options         []OptionDTO `json:"options"`
+	// Combo: isi paket & hemat dibanding beli satuan; null untuk produk biasa.
+	Combo *ComboDTO `json:"combo"`
+}
+
+type ComboDTO struct {
+	Items         []ComboItemDTO `json:"items"`
+	SeparatePrice int64          `json:"separate_price"` // total bila isinya dibeli satuan
+	Savings       int64          `json:"savings"`
+}
+
+type ComboItemDTO struct {
+	ProductID   string  `json:"product_id"`
+	ProductName string  `json:"product_name"`
+	OptionID    *string `json:"option_id"`
+	OptionName  *string `json:"option_name"`
+	Quantity    int     `json:"quantity"`
 }
 
 func ToBannerDTOs(in []Banner) []BannerDTO {
 	out := make([]BannerDTO, len(in))
 	for i, b := range in {
-		out[i] = BannerDTO{ID: b.ID, Title: b.Title, Subtitle: b.Subtitle, ImageURL: b.ImageURL, Deeplink: b.Deeplink}
+		out[i] = BannerDTO{ID: b.ID, Title: b.Title, Subtitle: b.Subtitle, ImageURL: b.ImageURL,
+			Action: BannerActionDTO{Type: b.ActionType, Value: b.ActionValue}}
 	}
 	return out
 }
@@ -67,6 +90,15 @@ func ToProductDTO(p Product) ProductDTO {
 		tags = append(tags, "best_seller")
 	}
 	var original *int64
+	var combo *ComboDTO
+	if p.IsCombo() {
+		tags = append(tags, "combo")
+		combo = &ComboDTO{SeparatePrice: p.SeparatePrice, Savings: p.ComboSavings(), Items: make([]ComboItemDTO, len(p.Bundle))}
+		for i, b := range p.Bundle {
+			combo.Items[i] = ComboItemDTO{ProductID: b.ProductID, ProductName: b.Name, OptionID: b.OptionID,
+				OptionName: b.OptionName, Quantity: b.Quantity}
+		}
+	}
 	if p.OnDeal() {
 		tags = append(tags, "promo")
 		v := p.OriginalPrice
@@ -90,6 +122,7 @@ func ToProductDTO(p Product) ProductDTO {
 		IsAvailable:     p.IsAvailable,
 		Tags:            tags,
 		Options:         opts,
+		Combo:           combo,
 	}
 }
 

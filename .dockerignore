@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+bin
+deploy
+secrets
+*.p8
+*.test
+*.out

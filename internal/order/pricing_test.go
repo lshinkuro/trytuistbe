@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"trytuist-api/internal/appconfig"
 	"trytuist-api/internal/catalog"
 	"trytuist-api/internal/httpx"
 )
@@ -113,11 +114,45 @@ func TestCheckVoucher(t *testing.T) {
 }
 
 func TestDeliveryFee(t *testing.T) {
-	if DeliveryFee(100000, 10000, 0) != 10000 {
+	flat := appconfig.OrderRules{DeliveryFee: 10000}
+	if DeliveryFee(100000, nil, flat) != 10000 {
 		t.Fatal("tanpa promo ongkir harus flat")
 	}
-	if DeliveryFee(50000, 10000, 50000) != 0 {
+	if DeliveryFee(50000, nil, appconfig.OrderRules{DeliveryFee: 10000, FreeDeliveryMinSubtotal: 50000}) != 0 {
 		t.Fatal("subtotal ≥ batas harus gratis")
+	}
+	km := func(f float64) *float64 { return &f }
+	r := appconfig.OrderRules{DeliveryFee: 10000, DeliveryBaseKM: 3, DeliveryFeePerKM: 2000, DeliveryFeeMax: 20000}
+	for _, c := range []struct {
+		km   *float64
+		want int64
+	}{
+		{nil, 10000},      // alamat tanpa koordinat → tarif dasar
+		{km(2.5), 10000},  // dalam jarak dasar
+		{km(3.0), 10000},  // tepat batas
+		{km(3.1), 12000},  // lewat sedikit → dibulatkan ke atas 1 km
+		{km(5.0), 14000},  // 2 km tambahan
+		{km(12.0), 20000}, // dibatasi fee_max
+	} {
+		if got := DeliveryFee(30000, c.km, r); got != c.want {
+			t.Fatalf("jarak %v: ongkir %d, mau %d", c.km, got, c.want)
+		}
+	}
+}
+
+func TestDeliveryETA(t *testing.T) {
+	r := appconfig.OrderRules{PrepMinutes: 15, CourierSpeedKMH: 20}
+	for _, c := range []struct {
+		km       float64
+		min, max int
+	}{
+		{0, 15, 25},   // hanya waktu siapkan
+		{2, 25, 35},   // 15 + 6 = 21 → 25
+		{6.5, 35, 45}, // 15 + 20 = 35
+	} {
+		if got := DeliveryETA(c.km, r); got.MinMinutes != c.min || got.MaxMinutes != c.max {
+			t.Fatalf("jarak %.1f: ETA %+v, mau %d–%d", c.km, got, c.min, c.max)
+		}
 	}
 }
 
@@ -160,5 +195,57 @@ func TestBuildLines_DealPrice(t *testing.T) {
 	}
 	if !products["P07"].OnDeal() || products["P07"].DiscountPercent() != 37 {
 		t.Fatal("P07 harus terdeteksi promo 37%")
+	}
+}
+
+func TestBuildLines_Stock(t *testing.T) {
+	products := fixtureProducts()
+	p := products["P01"]
+	three := 3
+	p.Stock = &three
+	products["P01"] = p
+	// Varian berbeda tetap memakai stok produk yang sama: 2 + 1 = 3 masih boleh.
+	if _, _, err := BuildLines([]ItemInput{
+		{ProductID: "P01", OptionID: "large", Quantity: 2},
+		{ProductID: "P01", OptionID: "regular", Quantity: 1},
+	}, products, DefaultRules); err != nil {
+		t.Fatalf("3 dari stok 3 harus boleh: %v", err)
+	}
+	_, _, err := BuildLines([]ItemInput{
+		{ProductID: "P01", OptionID: "large", Quantity: 2},
+		{ProductID: "P01", OptionID: "regular", Quantity: 2},
+	}, products, DefaultRules)
+	if errType(err) != "OUT_OF_STOCK" {
+		t.Fatalf("4 dari stok 3 harus OUT_OF_STOCK, dapat %v", err)
+	}
+}
+
+func TestWeekStart(t *testing.T) {
+	jkt, _ := time.LoadLocation("Asia/Jakarta")
+	for _, c := range []struct{ now, want string }{
+		{"2026-10-19T00:00:00+07:00", "2026-10-19"}, // Senin 00:00 → hari itu
+		{"2026-10-21T15:30:00+07:00", "2026-10-19"}, // Rabu
+		{"2026-10-25T23:59:00+07:00", "2026-10-19"}, // Minggu malam masih minggu yang sama
+		{"2026-10-18T20:00:00Z", "2026-10-19"},      // Senin 03:00 WIB walau di UTC masih Minggu
+	} {
+		now, _ := time.Parse(time.RFC3339, c.now)
+		if got := WeekStart(now, jkt).Format("2006-01-02"); got != c.want {
+			t.Errorf("%s → %s, harap %s", c.now, got, c.want)
+		}
+	}
+}
+
+func TestRefundInfo(t *testing.T) {
+	if refundInfo(StatusProcessing, 50000, 0) != nil {
+		t.Fatal("pesanan berjalan tanpa refund → tidak ada info")
+	}
+	if r := refundInfo(StatusCancelled, 50000, 0); r == nil || r.Status != RefundPending {
+		t.Fatalf("online batal tanpa refund → menunggu diproses: %v", r)
+	}
+	if r := refundInfo(StatusCompleted, 50000, 10000); r == nil || r.Status != RefundPartial {
+		t.Fatalf("refund sebagian: %v", r)
+	}
+	if r := refundInfo(StatusCancelled, 50000, 50000); r == nil || r.Status != RefundCompleted {
+		t.Fatalf("refund penuh: %v", r)
 	}
 }

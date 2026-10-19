@@ -10,15 +10,17 @@ INSERT INTO categories (id, name, icon, sort_order) VALUES
   ('rice', 'Nasi & Mie', '🍛', 3),
   ('fast_food', 'Burger & Ayam', '🍔', 4),
   ('snack', 'Camilan', '🍟', 5),
-  ('dessert', 'Dessert', '🍰', 6)
+  ('dessert', 'Dessert', '🍰', 6),
+  ('combo', 'Paket Hemat', '🍱', 0)
 ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, icon = EXCLUDED.icon, sort_order = EXCLUDED.sort_order;
 
--- Banner promo
-INSERT INTO banners (id, title, subtitle, image_url, sort_order) VALUES
-  ('B1', 'Diskon 30% Makan Siang', 'Semua menu makanan, khusus jam 11–14', 'https://images.unsplash.com/photo-1547573854-74d2a71d0826?w=1200&q=80&auto=format&fit=crop', 1),
-  ('B2', 'Gratis Ongkir Rp 0', 'Min. belanja Rp 50.000 se-Jakarta', 'https://images.unsplash.com/photo-1424847651672-bf20a4b0982b?w=1200&q=80&auto=format&fit=crop', 2),
-  ('B3', 'Kopi Pagi Cuma 15rb', 'Setiap hari sebelum jam 10 pagi', 'https://images.unsplash.com/photo-1596018589878-217d8603c4c6?w=1200&q=80&auto=format&fit=crop', 3)
-ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, subtitle = EXCLUDED.subtitle, image_url = EXCLUDED.image_url, sort_order = EXCLUDED.sort_order;
+-- Banner promo: setiap banner mengarah ke sesuatu yang benar-benar ada (promo D01, kupon mingguan, kategori combo).
+INSERT INTO banners (id, title, subtitle, image_url, sort_order, action_type, action_value) VALUES
+  ('B1', 'Nasi Goreng Spesial cuma 19rb', 'Promo makan hemat minggu ini', 'https://images.unsplash.com/photo-1547573854-74d2a71d0826?w=1200&q=80&auto=format&fit=crop', 1, 'PRODUCT', 'P07'),
+  ('B2', 'Gratis Ongkir 2x Seminggu', 'Aktifkan kuponnya di keranjang saat checkout', 'https://images.unsplash.com/photo-1424847651672-bf20a4b0982b?w=1200&q=80&auto=format&fit=crop', 2, 'FREE_DELIVERY', NULL),
+  ('B3', 'Paket Combo Hemat', 'Kopi + croissant mulai Rp 39rb', 'https://images.unsplash.com/photo-1596018589878-217d8603c4c6?w=1200&q=80&auto=format&fit=crop', 3, 'CATEGORY', 'combo')
+ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, subtitle = EXCLUDED.subtitle, image_url = EXCLUDED.image_url,
+  sort_order = EXCLUDED.sort_order, action_type = EXCLUDED.action_type, action_value = EXCLUDED.action_value, is_active = TRUE;
 
 -- Produk (foto: Unsplash, lisensi gratis)
 INSERT INTO products (id, category_id, name, description, price, image_url, rating, sold_count, is_available, is_best_seller, sort_order) VALUES
@@ -67,6 +69,23 @@ INSERT INTO product_options (product_id, id, name, extra_price, sort_order) VALU
   ('P10', 'jumbo', 'Porsi Jumbo', 8000, 3)
 ON CONFLICT (product_id, id) DO UPDATE SET name = EXCLUDED.name, extra_price = EXCLUDED.extra_price, sort_order = EXCLUDED.sort_order;
 
+-- Menu combo (paket isi tetap). Harga paket < total harga satuan.
+INSERT INTO products (id, category_id, name, description, price, image_url, rating, sold_count, is_available, is_best_seller, sort_order) VALUES
+  ('C01', 'combo', 'Paket Sarapan', 'Es Kopi Susu Gula Aren (Large) + Butter Croissant. Pas buat mulai hari.', 39000,
+   (SELECT image_url FROM products WHERE id = 'P13'), 4.8, 210, TRUE, FALSE, 0),
+  ('C02', 'combo', 'Paket Ayam Kenyang', 'Ayam Goreng Krispi + Iced Americano + Kentang Goreng.', 49000,
+   (SELECT image_url FROM products WHERE id = 'P10'), 4.7, 130, TRUE, FALSE, 1)
+ON CONFLICT (id) DO UPDATE SET category_id = EXCLUDED.category_id, name = EXCLUDED.name, description = EXCLUDED.description,
+  price = EXCLUDED.price, image_url = EXCLUDED.image_url, is_available = TRUE, sort_order = EXCLUDED.sort_order;
+
+DELETE FROM product_bundle_items WHERE bundle_id IN ('C01', 'C02');
+INSERT INTO product_bundle_items (bundle_id, product_id, option_id, quantity, sort_order) VALUES
+  ('C01', 'P01', 'large', 1, 1),
+  ('C01', 'P13', NULL, 1, 2),
+  ('C02', 'P10', 'normal', 1, 1),
+  ('C02', 'P04', 'regular', 1, 2),
+  ('C02', 'P12', NULL, 1, 3);
+
 -- Promo harga produk (§5.24). D01 tampil sebagai popup di Beranda; image_url NULL = foto produk.
 INSERT INTO product_deals (id, product_id, title, subtitle, badge, image_url, deal_price, starts_at, ends_at, show_as_popup, sort_order) VALUES
   ('D01', 'P07', 'Nasi Goreng Spesial cuma 19rb!', 'Promo makan hemat minggu ini. Selama persediaan ada.', '', NULL, 19900, now() - interval '1 day', now() + interval '30 days', TRUE, 1),
@@ -86,11 +105,13 @@ ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address,
   phone = EXCLUDED.phone, opens_at = EXCLUDED.opens_at, closes_at = EXCLUDED.closes_at,
   delivery_radius_km = EXCLUDED.delivery_radius_km, sort_order = EXCLUDED.sort_order;
 
--- Stok per outlet: Ramen Pedas habis di Kemang, Chocolate Cake habis di Kelapa Gading.
-INSERT INTO store_product_availability (store_id, product_id, is_available) VALUES
-  ('ST02', 'P09', FALSE),
-  ('ST03', 'P14', FALSE)
-ON CONFLICT (store_id, product_id) DO UPDATE SET is_available = EXCLUDED.is_available;
+-- Menu per outlet (§5.29): semua menu dijual di semua outlet, stok tidak dihitung, harga pusat.
+INSERT INTO store_products (store_id, product_id)
+SELECT s.id, p.id FROM stores s CROSS JOIN products p
+ON CONFLICT (store_id, product_id) DO UPDATE SET is_available = TRUE, stock = NULL, price = NULL;
+-- Ramen Pedas habis di Kemang, Chocolate Cake habis di Kelapa Gading.
+UPDATE store_products SET is_available = FALSE
+WHERE (store_id, product_id) IN (('ST02', 'P09'), ('ST03', 'P14'));
 
 -- Voucher
 INSERT INTO vouchers (code, title, description, discount_type, discount_value, min_subtotal, max_discount, starts_at, ends_at) VALUES

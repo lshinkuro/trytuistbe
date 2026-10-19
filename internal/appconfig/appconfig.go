@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -27,6 +28,17 @@ type OrderRules struct {
 	MaxNoteLength           int   `json:"max_note_length"`
 	DeliveryFee             int64 `json:"delivery_fee"`
 	FreeDeliveryMinSubtotal int64 `json:"free_delivery_min_subtotal"`
+	// Ongkir per jarak (§7): delivery_fee berlaku sampai delivery_base_km, lalu + delivery_fee_per_km
+	// tiap km berikutnya (dibulatkan ke atas). per_km 0 = flat. fee_max 0 = tanpa batas atas.
+	DeliveryBaseKM   float64 `json:"delivery_base_km"`
+	DeliveryFeePerKM int64   `json:"delivery_fee_per_km"`
+	DeliveryFeeMax   int64   `json:"delivery_fee_max"`
+	// Estimasi waktu antar = waktu siapkan pesanan + jarak / kecepatan kurir.
+	PrepMinutes     int     `json:"prep_minutes"`
+	CourierSpeedKMH float64 `json:"courier_speed_kmh"`
+	// Kupon gratis ongkir: kuota per user per minggu, dipakai bila user mengaktifkannya saat checkout.
+	FreeDeliveryCouponEnabled bool `json:"free_delivery_coupon_enabled"`
+	FreeDeliveryCouponWeekly  int  `json:"free_delivery_coupon_weekly"`
 }
 
 // PaymentMethod (key "payment_methods").
@@ -117,10 +129,37 @@ func (r *Repository) OrderRules(ctx context.Context, db database.DBTX) (OrderRul
 		return r.defaults, err
 	}
 	if rules.MinQuantity < 1 || rules.MaxQuantity < rules.MinQuantity || rules.MaxNoteLength < 0 ||
-		rules.DeliveryFee < 0 || rules.FreeDeliveryMinSubtotal < 0 {
+		rules.DeliveryFee < 0 || rules.FreeDeliveryMinSubtotal < 0 ||
+		rules.DeliveryBaseKM < 0 || rules.DeliveryFeePerKM < 0 || rules.DeliveryFeeMax < 0 ||
+		rules.PrepMinutes < 0 || rules.CourierSpeedKMH <= 0 || rules.FreeDeliveryCouponWeekly < 0 {
 		return r.defaults, fmt.Errorf("app_config order_rules tidak valid: %+v", rules)
 	}
 	return rules, nil
+}
+
+// MergeOrderRules menimpa sebagian field order_rules (field lain tetap), lalu membaca ulang
+// dengan validasi yang sama seperti saat quote. db sebaiknya transaksi: aturan tidak valid → rollback.
+func (r *Repository) MergeOrderRules(ctx context.Context, db database.DBTX, patch map[string]any) (OrderRules, error) {
+	b, err := json.Marshal(patch)
+	if err != nil {
+		return OrderRules{}, err
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO app_config (key, value) VALUES ('order_rules', $1::jsonb)
+		ON CONFLICT (key) DO UPDATE SET value = app_config.value || EXCLUDED.value, updated_at = now()`, b); err != nil {
+		return OrderRules{}, err
+	}
+	return r.OrderRules(ctx, db)
+}
+
+// OrderRulesUpdatedAt: kapan order_rules terakhir diubah (nil bila belum pernah disimpan).
+func (r *Repository) OrderRulesUpdatedAt(ctx context.Context) (*time.Time, error) {
+	var at time.Time
+	err := r.db.QueryRow(ctx, `SELECT updated_at FROM app_config WHERE key = 'order_rules'`).Scan(&at)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return &at, err
 }
 
 // PaymentMethods: nil bila key belum diisi (semua metode dianggap aktif).

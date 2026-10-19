@@ -39,18 +39,23 @@ type DealDTO struct {
 	ShowAsPopup  bool    `json:"show_as_popup"`
 	SortOrder    int     `json:"sort_order"`
 	Status       string  `json:"status"`
+	StoreID      *string `json:"store_id"` // null = semua outlet (§5.29)
+	StoreName    *string `json:"store_name"`
+	CanEdit      bool    `json:"can_edit"` // admin outlet tidak bisa mengubah promo pusat
 }
 
 const dealSelect = `
-	SELECT d.id, d.product_id, p.name, p.price, d.title, d.subtitle, d.badge, d.image_url, d.deal_price,
-	       d.starts_at, d.ends_at, d.is_active, d.show_as_popup, d.sort_order
-	FROM product_deals d JOIN products p ON p.id = d.product_id `
+	SELECT d.id, d.product_id, p.name, COALESCE(sp.price, p.price), d.title, d.subtitle, d.badge, d.image_url, d.deal_price,
+	       d.starts_at, d.ends_at, d.is_active, d.show_as_popup, d.sort_order, d.store_id, s.name
+	FROM product_deals d JOIN products p ON p.id = d.product_id
+	LEFT JOIN stores s ON s.id = d.store_id
+	LEFT JOIN store_products sp ON sp.store_id = d.store_id AND sp.product_id = d.product_id `
 
 func (h *Handler) scanDeal(row pgx.CollectableRow) (DealDTO, error) {
 	var d DealDTO
 	var starts, ends time.Time
 	err := row.Scan(&d.ID, &d.ProductID, &d.ProductName, &d.ProductPrice, &d.Title, &d.Subtitle, &d.Badge, &d.ImageURL,
-		&d.DealPrice, &starts, &ends, &d.IsActive, &d.ShowAsPopup, &d.SortOrder)
+		&d.DealPrice, &starts, &ends, &d.IsActive, &d.ShowAsPopup, &d.SortOrder, &d.StoreID, &d.StoreName)
 	if err != nil {
 		return d, err
 	}
@@ -72,10 +77,18 @@ func (h *Handler) scanDeal(row pgx.CollectableRow) (DealDTO, error) {
 	return d, nil
 }
 
-// GET /v1/admin/deals — semua promo, yang berjalan & terjadwal dulu.
+// GET /v1/admin/deals?store_id= — promo, yang berjalan & terjadwal dulu.
+// Super admin tanpa store_id: semua promo. Dengan outlet (atau admin outlet): promo pusat + promo outlet itu.
 func (h *Handler) Deals(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.pool.Query(r.Context(), dealSelect+`
-		ORDER BY (d.is_active AND d.ends_at > now()) DESC, d.sort_order, d.ends_at DESC, d.id`)
+	ctx := r.Context()
+	storeID, err := scopeStore(ctx, r.URL.Query().Get("store_id"))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	rows, err := h.pool.Query(ctx, dealSelect+`
+		WHERE $1 = '' OR d.store_id IS NULL OR d.store_id = $1
+		ORDER BY (d.is_active AND d.ends_at > now()) DESC, d.sort_order, d.ends_at DESC, d.id`, storeID)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -85,7 +98,19 @@ func (h *Handler) Deals(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
+	for i := range list {
+		list[i].CanEdit = canEditDeal(ctx, list[i]) == nil
+	}
 	httpx.JSON(w, http.StatusOK, list)
+}
+
+// canEditDeal: admin outlet hanya promo outletnya; promo pusat (store_id null) khusus super admin.
+func canEditDeal(ctx context.Context, d DealDTO) error {
+	a := adminFrom(ctx)
+	if a.IsSuper() || (d.StoreID != nil && *d.StoreID == a.StoreID) {
+		return nil
+	}
+	return httpx.NewError(http.StatusForbidden, "FORBIDDEN", "Promo ini milik pusat atau outlet lain.")
 }
 
 func (h *Handler) deal(ctx context.Context, id string) (DealDTO, error) {
@@ -97,6 +122,7 @@ func (h *Handler) deal(ctx context.Context, id string) (DealDTO, error) {
 	if database.IsNoRows(err) {
 		return d, httpx.NotFound("Promo tidak ditemukan.")
 	}
+	d.CanEdit = canEditDeal(ctx, d) == nil
 	return d, err
 }
 
@@ -113,6 +139,8 @@ type dealRequest struct {
 	IsActive    *bool      `json:"is_active"`
 	ShowAsPopup *bool      `json:"show_as_popup"`
 	SortOrder   *int       `json:"sort_order" validate:"omitempty,min=0,max=1000"`
+	// StoreID: "" = semua outlet. Hanya super admin; admin outlet selalu outletnya sendiri.
+	StoreID *string `json:"store_id" validate:"omitempty,max=50"`
 }
 
 // dealValues: nilai lengkap setelah request digabung dengan data lama.
@@ -123,6 +151,7 @@ type dealValues struct {
 	StartsAt, EndsAt                  time.Time
 	IsActive, ShowAsPopup             bool
 	SortOrder                         int
+	StoreID                           string // "" = semua outlet
 }
 
 func (req dealRequest) merge(base dealValues) dealValues {
@@ -165,6 +194,9 @@ func (req dealRequest) merge(base dealValues) dealValues {
 	if req.SortOrder != nil {
 		v.SortOrder = *req.SortOrder
 	}
+	if req.StoreID != nil {
+		v.StoreID = trim(req.StoreID)
+	}
 	return v
 }
 
@@ -191,13 +223,29 @@ func (h *Handler) validateDeal(ctx context.Context, v dealValues) error {
 	if len(details) > 0 {
 		return httpx.Validation("Data promo belum lengkap.", details...)
 	}
+	if v.StoreID != "" {
+		if _, ok, err := h.catalog.StoreByID(ctx, v.StoreID, false); err != nil || !ok {
+			if err != nil {
+				return err
+			}
+			return httpx.Validation("Outlet tidak ditemukan.", httpx.FieldDetail{Field: "store_id", Message: "tidak ditemukan"})
+		}
+	}
+	// Promo outlet dibandingkan dengan harga di outlet itu (bisa harga khusus outlet) dan menunya harus dijual di sana.
 	var price int64
-	err := h.pool.QueryRow(ctx, `SELECT price FROM products WHERE id = $1`, v.ProductID).Scan(&price)
+	var listed bool
+	err := h.pool.QueryRow(ctx, `
+		SELECT COALESCE(sp.price, p.price), $2 = '' OR sp.product_id IS NOT NULL
+		FROM products p LEFT JOIN store_products sp ON sp.product_id = p.id AND sp.store_id = $2
+		WHERE p.id = $1`, v.ProductID, v.StoreID).Scan(&price, &listed)
 	if database.IsNoRows(err) {
 		return httpx.Validation("Produk tidak ditemukan.", httpx.FieldDetail{Field: "product_id", Message: "produk tidak ada"})
 	}
 	if err != nil {
 		return err
+	}
+	if !listed {
+		return httpx.Validation("Menu ini tidak dijual di outlet tersebut.", httpx.FieldDetail{Field: "product_id", Message: "tidak dijual di outlet"})
 	}
 	if v.DealPrice >= price {
 		return &httpx.AppError{Status: http.StatusUnprocessableEntity, Type: "DEAL_PRICE_TOO_HIGH",
@@ -216,6 +264,13 @@ func (h *Handler) CreateDeal(w http.ResponseWriter, r *http.Request) {
 	}
 	v := req.merge(dealValues{StartsAt: h.now(), IsActive: true})
 	ctx := r.Context()
+	if a := adminFrom(ctx); !a.IsSuper() {
+		if v.StoreID != "" && v.StoreID != a.StoreID {
+			httpx.FromError(w, r, errOtherStore)
+			return
+		}
+		v.StoreID = a.StoreID
+	}
 	if err := h.validateDeal(ctx, v); err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -223,10 +278,11 @@ func (h *Handler) CreateDeal(w http.ResponseWriter, r *http.Request) {
 	var id string
 	err := h.pool.QueryRow(ctx, `
 		INSERT INTO product_deals (id, product_id, title, subtitle, badge, image_url, deal_price, starts_at, ends_at,
-		                           is_active, show_as_popup, sort_order)
-		VALUES ('DL-' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 10), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		                           is_active, show_as_popup, sort_order, store_id)
+		VALUES ('DL-' || substr(replace(gen_random_uuid()::text, '-', ''), 1, 10), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+		        NULLIF($12, ''))
 		RETURNING id`, v.ProductID, v.Title, v.Subtitle, v.Badge, v.ImageURL, v.DealPrice, v.StartsAt, v.EndsAt,
-		v.IsActive, v.ShowAsPopup, v.SortOrder).Scan(&id)
+		v.IsActive, v.ShowAsPopup, v.SortOrder, v.StoreID).Scan(&id)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -251,6 +307,12 @@ func (h *Handler) UpdateDeal(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	id := chi.URLParam(r, "id")
 	cur, err := h.deal(ctx, id)
+	if err == nil {
+		err = canEditDeal(ctx, cur)
+	}
+	if err == nil && req.StoreID != nil && !adminFrom(ctx).IsSuper() {
+		err = errNotSuper // admin outlet tidak bisa memindahkan promo ke outlet lain
+	}
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
@@ -260,7 +322,7 @@ func (h *Handler) UpdateDeal(w http.ResponseWriter, r *http.Request) {
 	v := req.merge(dealValues{
 		ProductID: cur.ProductID, Title: cur.Title, Subtitle: cur.Subtitle, Badge: cur.Badge, ImageURL: cur.ImageURL,
 		DealPrice: cur.DealPrice, StartsAt: starts, EndsAt: ends, IsActive: cur.IsActive, ShowAsPopup: cur.ShowAsPopup,
-		SortOrder: cur.SortOrder,
+		SortOrder: cur.SortOrder, StoreID: deref(cur.StoreID),
 	})
 	if err := h.validateDeal(ctx, v); err != nil {
 		httpx.FromError(w, r, err)
@@ -268,9 +330,9 @@ func (h *Handler) UpdateDeal(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := h.pool.Exec(ctx, `
 		UPDATE product_deals SET product_id = $2, title = $3, subtitle = $4, badge = $5, image_url = $6, deal_price = $7,
-		       starts_at = $8, ends_at = $9, is_active = $10, show_as_popup = $11, sort_order = $12
+		       starts_at = $8, ends_at = $9, is_active = $10, show_as_popup = $11, sort_order = $12, store_id = NULLIF($13, '')
 		WHERE id = $1`, id, v.ProductID, v.Title, v.Subtitle, v.Badge, v.ImageURL, v.DealPrice, v.StartsAt, v.EndsAt,
-		v.IsActive, v.ShowAsPopup, v.SortOrder); err != nil {
+		v.IsActive, v.ShowAsPopup, v.SortOrder, v.StoreID); err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
@@ -288,6 +350,9 @@ func (h *Handler) DeleteDeal(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	id := chi.URLParam(r, "id")
 	d, err := h.deal(ctx, id)
+	if err == nil {
+		err = canEditDeal(ctx, d)
+	}
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return

@@ -25,6 +25,8 @@ type Gateway interface {
 	Status(ctx context.Context, orderID string) (TransactionStatus, error)
 	// Expire: hentikan transaksi pending (VA/QR tidak bisa dibayar lagi).
 	Expire(ctx context.Context, orderID string) error
+	// Refund: kembalikan dana (penuh / sebagian). refund_key yang sama tidak diproses dua kali oleh Midtrans.
+	Refund(ctx context.Context, orderID string, req RefundRequest) error
 	// VerifySignature: signature_key notifikasi = SHA512(order_id + status_code + gross_amount + server key).
 	VerifySignature(n Notification) bool
 }
@@ -80,6 +82,12 @@ type TransactionStatus struct {
 	StatusCode        string `json:"status_code"`
 	StatusMessage     string `json:"status_message"`
 	GrossAmount       string `json:"gross_amount"` // "49800.00"
+}
+
+type RefundRequest struct {
+	RefundKey string `json:"refund_key"`
+	Amount    int64  `json:"amount"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // Notification: body webhook Midtrans (field lain diabaikan).
@@ -199,6 +207,20 @@ func (g *HTTPGateway) Expire(ctx context.Context, orderID string) error {
 	}
 	if status >= 300 || (out.StatusCode != "" && out.StatusCode != "200" && out.StatusCode != "407") {
 		return &GatewayError{HTTPStatus: status, Messages: out.StatusCode + " " + out.StatusMessage}
+	}
+	return nil
+}
+
+func (g *HTTPGateway) Refund(ctx context.Context, orderID string, req RefundRequest) error {
+	b, status, err := g.do(ctx, http.MethodPost, g.apiBase+"/"+url.PathEscape(orderID)+"/refund", req)
+	if err != nil {
+		return err
+	}
+	var out TransactionStatus
+	_ = json.Unmarshal(b, &out)
+	// Berhasil = status_code "200"; selain itu (412 status tidak bisa diubah, 413 jumlah salah, …) ditolak.
+	if status >= 300 || out.StatusCode != "200" {
+		return &GatewayError{HTTPStatus: status, Messages: strings.TrimSpace(out.StatusCode + " " + out.StatusMessage)}
 	}
 	return nil
 }

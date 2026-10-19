@@ -15,6 +15,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"trytuist-api/docs"
 	"trytuist-api/internal/admin"
 	"trytuist-api/internal/appconfig"
 	"trytuist-api/internal/auth"
@@ -95,6 +96,7 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 		MinQuantity: order.DefaultRules.MinQuantity, MaxQuantity: order.DefaultRules.MaxQuantity,
 		MaxNoteLength: order.DefaultRules.NoteMaxChars,
 		DeliveryFee:   cfg.DeliveryFee, FreeDeliveryMinSubtotal: cfg.FreeDeliveryMinSubtotal,
+		PrepMinutes: 15, CourierSpeedKMH: 20, FreeDeliveryCouponWeekly: 2,
 	})
 	appConfigH := appconfig.NewHandler(appConfig)
 	orderSvc := order.NewService(pool, order.Config{AppConfig: appConfig, Location: cfg.Timezone,
@@ -109,7 +111,7 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 		EnabledPayments: cfg.MidtransEnabledPayments, Location: cfg.Timezone, Notifier: pushSvc,
 	})
 	checkoutH := payment.NewHandler(paymentSvc)
-	adminH := admin.NewHandler(pool, orderSvc, cfg.Timezone)
+	adminH := admin.NewHandler(pool, orderSvc, paymentSvc, appConfig, cfg.Timezone)
 	homeH := home.NewHandler(pool, cfg.Timezone)
 	promoH := promo.NewHandler(pool)
 	userH := user.NewHandler(user.NewService(pool))
@@ -123,6 +125,12 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 	r.MethodNotAllowed(httpx.MethodNotAllowedHandler)
 
 	r.Get("/healthz", health(cfg, pool))
+
+	// Dokumentasi API (Swagger UI). Tidak dibuka di prod.
+	if !cfg.IsProd() {
+		r.Get("/docs", docs.UI)
+		r.Get("/docs/openapi.yaml", docs.SpecYAML)
+	}
 
 	// Midtrans (§5.27): publik, tanpa X-API-Key. Webhook divalidasi signature_key.
 	r.Post("/v1/payments/midtrans/notification", checkoutH.Notification)
@@ -192,6 +200,8 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 				// Hanya dev: simulasi perubahan status pesanan oleh outlet/kurir.
 				r.Post("/dev/orders/{id}/status", orderH.DevSetStatus)
 				r.Post("/dev/push-test", pushH.DevTest)
+				// Hanya dev: lunas / ditolak / kedaluwarsa tanpa simulator Midtrans di browser.
+				r.Post("/dev/payments/{id}/simulate", checkoutH.DevSimulate)
 			}
 		})
 
@@ -212,11 +222,31 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 			r.Patch("/deals/{id}", adminH.UpdateDeal)
 			r.Delete("/deals/{id}", adminH.DeleteDeal)
 			r.Get("/stores", adminH.Stores)
-			r.Post("/stores", adminH.CreateStore)
 			r.Patch("/stores/{id}", adminH.UpdateStore)
-			r.Put("/stores/{id}/products/{product_id}", adminH.SetStoreStock)
-			r.Get("/customers", adminH.Customers)
-			r.Get("/audit-logs", adminH.AuditLogs)
+			r.Put("/stores/{id}/products/{product_id}", adminH.SetStoreProduct)
+			r.Get("/categories", adminH.Categories)
+			r.Get("/payments", adminH.Payments)
+			r.Get("/payments/{id}", adminH.Payment)
+			// Khusus super admin (§5.29).
+			r.Group(func(r chi.Router) {
+				r.Use(admin.RequireSuperAdmin)
+				r.Post("/stores", adminH.CreateStore)
+				r.Post("/categories", adminH.CreateCategory)
+				r.Patch("/categories/{id}", adminH.UpdateCategory)
+				r.Get("/staff", adminH.Staff)
+				r.Post("/staff", adminH.CreateStaff)
+				r.Patch("/staff/{id}", adminH.UpdateStaff)
+				r.Get("/customers", adminH.Customers)
+				r.Get("/audit-logs", adminH.AuditLogs)
+				r.Post("/payments/{id}/refund", adminH.RefundPayment)
+				r.Get("/delivery-settings", adminH.DeliverySettings)
+				r.Patch("/delivery-settings", adminH.UpdateDeliverySettings)
+				r.Post("/delivery-settings/preview", adminH.PreviewDeliverySettings)
+				r.Get("/banners", adminH.Banners)
+				r.Post("/banners", adminH.CreateBanner)
+				r.Patch("/banners/{id}", adminH.UpdateBanner)
+				r.Delete("/banners/{id}", adminH.DeleteBanner)
+			})
 		})
 	})
 	return &App{Handler: r, Payments: paymentSvc, Push: pushSvc}

@@ -38,7 +38,8 @@ type AdminStoreDTO struct {
 	IsTempClosed     bool          `json:"is_temporarily_closed"` // tombol tutup sementara
 	IsOpenNow        bool          `json:"is_open_now"`
 	SortOrder        int           `json:"sort_order"`
-	UnavailableCount int           `json:"unavailable_products"` // menu yang ditandai habis khusus outlet ini
+	UnavailableCount int           `json:"unavailable_products"` // menu yang dijual tapi habis (saklar atau stok 0)
+	ListedCount      int           `json:"listed_products"`      // menu yang dijual di outlet ini
 	Today            StoreTodayDTO `json:"today"`
 }
 
@@ -57,13 +58,15 @@ func (h *Handler) storeDTO(ctx context.Context, s catalog.Store) (AdminStoreDTO,
 		SELECT count(*)::int,
 		       COALESCE(sum(total) FILTER (WHERE status = 'COMPLETED'), 0)::bigint,
 		       count(*) FILTER (WHERE status IN ('PENDING','PAID','PROCESSING','DELIVERING'))::int,
-		       (SELECT count(*)::int FROM store_product_availability WHERE store_id = $1 AND NOT is_available)
+		       (SELECT count(*)::int FROM store_products WHERE store_id = $1 AND (NOT is_available OR stock = 0)),
+		       (SELECT count(*)::int FROM store_products WHERE store_id = $1)
 		FROM orders WHERE store_id = $1 AND created_at >= $2`, s.ID, dayStart).
-		Scan(&d.Today.Orders, &d.Today.Revenue, &d.Today.Active, &d.UnavailableCount)
+		Scan(&d.Today.Orders, &d.Today.Revenue, &d.Today.Active, &d.UnavailableCount, &d.ListedCount)
 	return d, err
 }
 
 // GET /v1/admin/stores — semua outlet (termasuk nonaktif) + ringkasan hari ini.
+// Admin outlet hanya melihat outletnya sendiri.
 func (h *Handler) Stores(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	stores, err := h.catalog.AllStores(ctx)
@@ -71,8 +74,12 @@ func (h *Handler) Stores(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
+	a := adminFrom(ctx)
 	out := make([]AdminStoreDTO, 0, len(stores))
 	for _, s := range stores {
+		if !a.IsSuper() && s.ID != a.StoreID {
+			continue
+		}
 		d, err := h.storeDTO(ctx, s)
 		if err != nil {
 			httpx.FromError(w, r, err)
@@ -164,7 +171,7 @@ func (h *Handler) CreateStore(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, storeIDLockKey); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			INSERT INTO stores (id, name, address, lat, lng, phone, opens_at, closes_at, delivery_radius_km, is_open, sort_order)
 			SELECT 'ST' || CASE WHEN n.next < 10 THEN '0' ELSE '' END || n.next::text,
 			       $1, $2, $3, $4, NULLIF($5, ''), COALESCE($6::time, '08:00'), COALESCE($7::time, '22:00'),
@@ -174,6 +181,12 @@ func (h *Handler) CreateStore(w http.ResponseWriter, r *http.Request) {
 			RETURNING id`,
 			*req.Name, *req.Address, *req.Lat, *req.Lng, deref(req.Phone), clockSQL(opens), clockSQL(closes),
 			req.RadiusKM, req.IsTempClosed, req.SortOrder).Scan(&id)
+		if err != nil {
+			return err
+		}
+		// Outlet baru menjual semua menu katalog pusat (harga pusat, stok tidak dihitung).
+		_, err = tx.Exec(ctx, `INSERT INTO store_products (store_id, product_id) SELECT $1, id FROM products`, id)
+		return err
 	})
 	if err != nil {
 		httpx.FromError(w, r, err)
@@ -196,6 +209,17 @@ func (h *Handler) UpdateStore(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	id := chi.URLParam(r, "id")
+	if err := canManageStore(ctx, id); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	// Admin outlet hanya mengatur jam buka, tutup sementara, radius & telepon outletnya.
+	if !adminFrom(ctx).IsSuper() && (req.Name != nil || req.Address != nil || req.Lat != nil || req.Lng != nil ||
+		req.IsActive != nil || req.SortOrder != nil) {
+		httpx.FromError(w, r, httpx.NewError(http.StatusForbidden, "FORBIDDEN",
+			"Nama, alamat, lokasi & status aktif outlet hanya bisa diubah super admin."))
+		return
+	}
 	tag, err := h.pool.Exec(ctx, `
 		UPDATE stores SET
 			name = COALESCE($2, name), address = COALESCE($3, address),
@@ -247,20 +271,27 @@ func (h *Handler) respondStore(w http.ResponseWriter, r *http.Request, id string
 	httpx.JSONMessage(w, status, message, d)
 }
 
-type storeStockRequest struct {
-	IsAvailable *bool `json:"is_available" validate:"required"`
+// storeProductRequest: keadaan menu di satu outlet (PUT = diganti seluruhnya).
+type storeProductRequest struct {
+	IsListed    *bool  `json:"is_listed"`                                     // default true; false = berhenti menjual di outlet ini
+	IsAvailable *bool  `json:"is_available"`                                  // default true; false = ditandai habis
+	Stock       *int   `json:"stock" validate:"omitempty,min=0,max=1000000"`  // null = tidak dihitung
+	Price       *int64 `json:"price" validate:"omitempty,min=1,max=10000000"` // null = harga pusat
 }
 
-// PUT /v1/admin/stores/{id}/products/{product_id} { is_available }
-// Habis di outlet ini saja; tersedia = ikut status pusat (baris override dihapus).
-func (h *Handler) SetStoreStock(w http.ResponseWriter, r *http.Request) {
-	var req storeStockRequest
+// PUT /v1/admin/stores/{id}/products/{product_id} { is_listed, is_available, stock, price } (§5.29)
+func (h *Handler) SetStoreProduct(w http.ResponseWriter, r *http.Request) {
+	var req storeProductRequest
 	if err := httpx.Decode(r, &req); err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
 	ctx := r.Context()
 	storeID, productID := chi.URLParam(r, "id"), chi.URLParam(r, "product_id")
+	if err := canManageStore(ctx, storeID); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
 	s, ok, err := h.catalog.StoreByID(ctx, storeID, false)
 	if err == nil && !ok {
 		err = httpx.NotFound("Outlet tidak ditemukan.")
@@ -269,31 +300,70 @@ func (h *Handler) SetStoreStock(w http.ResponseWriter, r *http.Request) {
 		httpx.FromError(w, r, err)
 		return
 	}
-	p, err := h.product(ctx, productID)
+	before, err := h.productAt(ctx, productID, storeID)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
-	if *req.IsAvailable {
-		_, err = h.pool.Exec(ctx, `DELETE FROM store_product_availability WHERE store_id = $1 AND product_id = $2`, storeID, productID)
-	} else {
+	listed, available := req.IsListed == nil || *req.IsListed, req.IsAvailable == nil || *req.IsAvailable
+	if listed {
 		_, err = h.pool.Exec(ctx, `
-			INSERT INTO store_product_availability (store_id, product_id, is_available) VALUES ($1, $2, FALSE)
-			ON CONFLICT (store_id, product_id) DO UPDATE SET is_available = FALSE, updated_at = now()`, storeID, productID)
+			INSERT INTO store_products (store_id, product_id, is_available, stock, price) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (store_id, product_id) DO UPDATE
+			SET is_available = $3, stock = $4, price = $5, updated_at = now()`,
+			storeID, productID, available, req.Stock, req.Price)
+	} else {
+		_, err = h.pool.Exec(ctx, `DELETE FROM store_products WHERE store_id = $1 AND product_id = $2`, storeID, productID)
 	}
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
-	state := map[bool]string{true: "tersedia", false: "habis"}[*req.IsAvailable]
-	h.audit(r, "STORE_STOCK", "product", productID, fmt.Sprintf("%s %s di %s", p.ProductName, state, s.Name),
-		map[string]any{"store_id": storeID, "is_available": *req.IsAvailable})
-	p, err = h.productAt(ctx, productID, storeID)
+	after, err := h.productAt(ctx, productID, storeID)
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return
 	}
-	httpx.JSONMessage(w, http.StatusOK, "Stok outlet diperbarui", p)
+	h.audit(r, "STORE_PRODUCT", "product", productID,
+		fmt.Sprintf("%s di %s: %s", after.ProductName, s.Name, storeProductSummary(*before.Store, *after.Store)),
+		map[string]any{"store_id": storeID, "before": before.Store, "after": after.Store})
+	httpx.JSONMessage(w, http.StatusOK, "Menu outlet diperbarui", after)
+}
+
+// storeProductSummary: kalimat audit, mis. "stok 10 → 4, harga Rp 22.000 → Rp 20.000".
+func storeProductSummary(b, a StoreProductDTO) string {
+	if !a.IsListed {
+		return "berhenti dijual"
+	}
+	var parts []string
+	if !b.IsListed {
+		parts = append(parts, "mulai dijual")
+	}
+	if b.IsSoldOut != a.IsSoldOut {
+		parts = append(parts, map[bool]string{true: "habis", false: "tersedia"}[a.IsSoldOut])
+	}
+	stock := func(p *int) string {
+		if p == nil {
+			return "tidak dihitung"
+		}
+		return fmt.Sprint(*p)
+	}
+	if stock(b.Stock) != stock(a.Stock) {
+		parts = append(parts, "stok "+stock(b.Stock)+" → "+stock(a.Stock))
+	}
+	price := func(p *int64) string {
+		if p == nil {
+			return "harga pusat"
+		}
+		return rupiah(*p)
+	}
+	if price(b.Price) != price(a.Price) {
+		parts = append(parts, price(b.Price)+" → "+price(a.Price))
+	}
+	if len(parts) == 0 {
+		return "tidak berubah"
+	}
+	return strings.Join(parts, ", ")
 }
 
 func deref(p *string) string {

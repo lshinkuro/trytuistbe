@@ -51,6 +51,10 @@ type QuoteInput struct {
 	AddressID   string
 	VoucherCode string
 	Items       []ItemInput
+	// UseFreeDelivery: user mengaktifkan kupon gratis ongkir untuk pesanan ini.
+	UseFreeDelivery bool
+	// skipPendingCoupons: checkout online membatalkan sesi bayar PENDING lama, jadi kuponnya tidak dihitung.
+	skipPendingCoupons bool
 }
 
 type CreateInput struct {
@@ -181,15 +185,12 @@ func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in
 	}
 	q.StoreID, q.StoreName = store.ID, store.Name
 
-	// Harga sama di semua outlet; ketersediaan mengikuti outlet.
+	// Harga, promo, stok & menu yang dijual mengikuti outlet (§5.29).
 	ids := make([]string, 0, len(in.Items))
 	for _, it := range in.Items {
 		ids = append(ids, it.ProductID)
 	}
-	products, err := cat.ProductsByIDs(ctx, ids)
-	if err == nil {
-		err = cat.ApplyStoreAvailabilityMap(ctx, store.ID, products)
-	}
+	products, err := cat.ProductsByIDs(ctx, ids, store.ID)
 	if err != nil {
 		return Quote{}, err
 	}
@@ -209,7 +210,15 @@ func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in
 	}
 	q.Lines, q.Subtotal = lines, subtotal
 
-	q.DeliveryFee = DeliveryFee(subtotal, rules.DeliveryFee, rules.FreeDeliveryMinSubtotal)
+	if coord != nil {
+		d := store.DistanceKM(*coord)
+		eta := DeliveryETA(d, rules)
+		q.DistanceKM, q.ETA = &d, &eta
+	}
+	q.DeliveryFee = DeliveryFee(subtotal, q.DistanceKM, rules)
+	if err := s.applyFreeDelivery(ctx, db, userID, in, rules, &q); err != nil {
+		return Quote{}, err
+	}
 
 	// Voucher (opsional)
 	if code := strings.TrimSpace(in.VoucherCode); code != "" {
@@ -248,6 +257,38 @@ func (s *Service) quote(ctx context.Context, db database.DBTX, userID string, in
 		q.Total = 0
 	}
 	return q, nil
+}
+
+// applyFreeDelivery: hitung sisa kupon minggu ini; bila diminta & ongkir > 0, ongkir ditanggung toko.
+// Kupon tidak terpakai bila ongkir memang sudah 0 (mis. gratis ongkir karena subtotal).
+func (s *Service) applyFreeDelivery(ctx context.Context, db database.DBTX, userID string, in QuoteInput,
+	rules appconfig.OrderRules, q *Quote) error {
+	since := WeekStart(s.now(), s.cfg.Location)
+	st := FreeDeliveryStatus{Enabled: rules.FreeDeliveryCouponEnabled && rules.FreeDeliveryCouponWeekly > 0,
+		WeeklyQuota: rules.FreeDeliveryCouponWeekly, ResetsAt: since.AddDate(0, 0, 7)}
+	if st.Enabled {
+		used, err := s.repo.FreeDeliveryUsed(ctx, db, userID, since, !in.skipPendingCoupons)
+		if err != nil {
+			return err
+		}
+		st.Used = used
+	}
+	q.FreeDelivery = &st
+	if !in.UseFreeDelivery {
+		return nil
+	}
+	if !st.Enabled {
+		return httpx.Unprocessable("FREE_DELIVERY_UNAVAILABLE", "Kupon gratis ongkir sedang tidak tersedia.")
+	}
+	if q.DeliveryFee == 0 {
+		return nil
+	}
+	if st.Remaining() == 0 {
+		return httpx.Unprocessable("FREE_DELIVERY_QUOTA_EXCEEDED",
+			fmt.Sprintf("Kupon gratis ongkir minggu ini sudah habis (%d/%d). Kuota baru mulai Senin.", st.Used, st.WeeklyQuota))
+	}
+	q.FreeDeliveryCoupon, q.DeliveryFeeWaived, q.DeliveryFee = true, q.DeliveryFee, 0
+	return nil
 }
 
 // pickStore: outlet dari store_id, atau pilihan otomatis untuk alamat ini.
@@ -306,6 +347,12 @@ func (s *Service) Create(ctx context.Context, userID string, in CreateInput) (Or
 
 	var orderID string
 	err = database.InTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if in.UseFreeDelivery {
+			// Dua checkout bersamaan dari user yang sama: yang kedua menunggu, lalu menghitung kuota dari data terbaru.
+			if err := s.repo.LockUser(ctx, tx, userID); err != nil {
+				return err
+			}
+		}
 		quoteInput := in.QuoteInput
 		// Alamat kosong → alamat utama user (bila ada). Tanpa alamat sama sekali tetap boleh (ambil di outlet).
 		if strings.TrimSpace(quoteInput.AddressID) == "" {

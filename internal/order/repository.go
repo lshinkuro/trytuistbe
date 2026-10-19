@@ -2,12 +2,14 @@ package order
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"trytuist-api/internal/database"
+	"trytuist-api/internal/httpx"
 )
 
 // Status pesanan (enum order_status di DB).
@@ -83,6 +85,38 @@ type Order struct {
 	Items                []Line
 	History              []StatusEvent
 	Rating               *Rating
+	DistanceKM           *float64
+	ETA                  *ETA
+	FreeDeliveryCoupon   bool
+	DeliveryFeeWaived    int64
+	// Pengembalian dana pesanan Bayar Online; nil untuk COD / tidak ada refund.
+	Refund *RefundInfo
+}
+
+// RefundInfo: status pengembalian dana yang dilihat pelanggan.
+type RefundInfo struct {
+	Status string // PENDING (menunggu diproses toko) | PARTIAL | COMPLETED
+	Amount int64  // yang sudah dikembalikan
+}
+
+const (
+	RefundPending   = "PENDING"
+	RefundPartial   = "PARTIAL"
+	RefundCompleted = "COMPLETED"
+)
+
+// refundInfo: dari total refund berhasil (payment_refunds) & status pesanan.
+// Pesanan online yang batal/gagal tanpa refund = PENDING (toko wajib mengembalikan dana).
+func refundInfo(orderStatus string, total, refunded int64) *RefundInfo {
+	switch {
+	case refunded >= total && refunded > 0:
+		return &RefundInfo{Status: RefundCompleted, Amount: refunded}
+	case refunded > 0:
+		return &RefundInfo{Status: RefundPartial, Amount: refunded}
+	case orderStatus == StatusCancelled || orderStatus == StatusFailed:
+		return &RefundInfo{Status: RefundPending}
+	}
+	return nil
 }
 
 type Summary struct {
@@ -113,6 +147,27 @@ func (Repository) StoreByID(ctx context.Context, db database.DBTX, id string) (S
 	err := db.QueryRow(ctx, `SELECT id, name, address, is_open FROM stores WHERE id = $1`, id).
 		Scan(&s.ID, &s.Name, &s.Address, &s.IsOpen)
 	return s, err
+}
+
+// FreeDeliveryUsed: kupon gratis ongkir terpakai sejak `since`: pesanan yang tidak batal/gagal,
+// plus (bila includePending) sesi bayar online PENDING yang memakai kupon.
+func (Repository) FreeDeliveryUsed(ctx context.Context, db database.DBTX, userID string, since time.Time, includePending bool) (int, error) {
+	var n int
+	err := db.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM orders
+		         WHERE user_id = $1 AND free_delivery_coupon AND created_at >= $2
+		           AND status NOT IN ('CANCELLED', 'FAILED'))
+		     + CASE WHEN $3 THEN (SELECT count(*) FROM payments
+		         WHERE user_id = $1 AND status = 'PENDING' AND order_id IS NULL AND created_at >= $2
+		           AND (snapshot->'quote'->>'FreeDeliveryCoupon')::boolean IS TRUE) ELSE 0 END`,
+		userID, since, includePending).Scan(&n)
+	return n, err
+}
+
+// LockUser: kunci baris user dalam transaksi (serialisasi checkout per user).
+func (Repository) LockUser(ctx context.Context, tx pgx.Tx, userID string) error {
+	_, err := tx.Exec(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID)
+	return err
 }
 
 // AddressCoord: alamat milik user? + koordinatnya (boleh kosong).
@@ -218,33 +273,69 @@ func (Repository) InsertOrder(ctx context.Context, tx pgx.Tx, in insertOrder) (s
 	if q.Voucher != nil {
 		voucherID = &q.Voucher.ID
 	}
+	var etaMin, etaMax *int
+	if q.ETA != nil {
+		etaMin, etaMax = &q.ETA.MinMinutes, &q.ETA.MaxMinutes
+	}
 	var id string
 	err := tx.QueryRow(ctx, `
 		INSERT INTO orders (order_number, user_id, store_id, address_id, subtotal, delivery_fee, discount, total,
 		                    voucher_id, payment_method, note, idempotency_key,
-		                    payment_account_id, payment_provider, payment_account_masked, status, payment_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::order_status, $17)
+		                    payment_account_id, payment_provider, payment_account_masked, status, payment_id,
+		                    distance_km, eta_min_minutes, eta_max_minutes, free_delivery_coupon, delivery_fee_waived)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::order_status, $17, $18, $19, $20, $21, $22)
 		RETURNING id::text`,
 		in.OrderNumber, in.UserID, q.StoreID, q.AddressID, q.Subtotal, q.DeliveryFee, q.Discount, q.Total,
 		voucherID, in.Payment.Method, in.Note, in.IdempotencyKey,
-		in.Payment.AccountID, in.Payment.Provider, in.Payment.AccountMasked, status, in.PaymentID).Scan(&id)
+		in.Payment.AccountID, in.Payment.Provider, in.Payment.AccountMasked, status, in.PaymentID,
+		q.DistanceKM, etaMin, etaMax, q.FreeDeliveryCoupon, q.DeliveryFeeWaived).Scan(&id)
 	if err != nil {
 		return "", err
 	}
 	batch := &pgx.Batch{}
 	for i, l := range q.Lines {
+		var bundle []byte
+		if len(l.Bundle) > 0 {
+			if bundle, err = json.Marshal(l.Bundle); err != nil {
+				return "", err
+			}
+		}
 		batch.Queue(`
-			INSERT INTO order_items (order_id, product_id, product_name, option_id, option_name, unit_price, quantity, note, subtotal, sort_order)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-			id, l.ProductID, l.ProductName, l.OptionID, l.OptionName, l.UnitPrice, l.Quantity, l.Note, l.Subtotal, i)
+			INSERT INTO order_items (order_id, product_id, product_name, option_id, option_name, unit_price, quantity, note, subtotal, sort_order, bundle_items)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			id, l.ProductID, l.ProductName, l.OptionID, l.OptionName, l.UnitPrice, l.Quantity, l.Note, l.Subtotal, i, bundle)
 		batch.Queue(`UPDATE products SET sold_count = sold_count + $2 WHERE id = $1`, l.ProductID, l.Quantity)
 	}
 	batch.Queue(`INSERT INTO order_status_history (order_id, status, note) VALUES ($1, $2::order_status, $3)`, id, status, in.HistoryNote)
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return "", err
 	}
-	return id, nil
+	// Stok outlet (§5.29). Pesanan yang sudah dibayar online tetap dibuat; stok berhenti di 0.
+	newStock := `sp.stock - oi.qty`
+	if status != StatusPending {
+		newStock = `GREATEST(sp.stock - oi.qty, 0)`
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE store_products sp SET stock = `+newStock+`, updated_at = now()
+		FROM (`+stockUnits+`) oi
+		WHERE sp.store_id = $2 AND sp.product_id = oi.product_id AND sp.stock IS NOT NULL`, id, q.StoreID)
+	if database.IsCheckViolation(err) {
+		// Stok diambil pesanan lain di antara quote dan insert.
+		return "", httpx.Unprocessable("OUT_OF_STOCK", "Stok menu di keranjangmu baru saja berkurang. Muat ulang menu lalu coba lagi.")
+	}
+	return id, err
 }
+
+// stockUnits: unit stok yang dipakai pesanan $1 = semua baris (termasuk combo itu sendiri)
+// + isi combo dari snapshot bundle_items (jumlah paket × jumlah isi per paket).
+const stockUnits = `
+	SELECT product_id, sum(qty)::int AS qty FROM (
+		SELECT product_id, quantity AS qty FROM order_items WHERE order_id = $1
+		UNION ALL
+		SELECT b->>'product_id', oi.quantity * (b->>'quantity')::int
+		FROM order_items oi, jsonb_array_elements(oi.bundle_items) b
+		WHERE oi.order_id = $1 AND oi.bundle_items IS NOT NULL
+	) u GROUP BY product_id`
 
 // OrderStatusForUpdate mengunci order milik user; pgx.ErrNoRows bila tidak ada.
 func (Repository) OrderStatusForUpdate(ctx context.Context, tx pgx.Tx, id, userID string) (status string, voucherID *string, err error) {
@@ -269,12 +360,20 @@ func (Repository) OrderOwner(ctx context.Context, db database.DBTX, id string) (
 	return userID, err
 }
 
-// RevertSoldCount dipanggil saat pesanan batal/gagal.
+// RevertSoldCount dipanggil saat pesanan batal/gagal: sold_count turun & stok outlet kembali.
 func (Repository) RevertSoldCount(ctx context.Context, tx pgx.Tx, orderID string) error {
 	_, err := tx.Exec(ctx, `
 		UPDATE products p SET sold_count = GREATEST(p.sold_count - oi.qty, 0)
 		FROM (SELECT product_id, sum(quantity)::int AS qty FROM order_items WHERE order_id = $1 GROUP BY product_id) oi
 		WHERE p.id = oi.product_id`, orderID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE store_products sp SET stock = sp.stock + oi.qty, updated_at = now()
+		FROM (`+stockUnits+`) oi,
+		     orders o
+		WHERE o.id = $1 AND sp.store_id = o.store_id AND sp.product_id = oi.product_id AND sp.stock IS NOT NULL`, orderID)
 	return err
 }
 
@@ -341,11 +440,13 @@ func (Repository) List(ctx context.Context, db database.DBTX, userID string, f L
 func (Repository) Get(ctx context.Context, db database.DBTX, id, userID string) (Order, error) {
 	var o Order
 	var addrID *string
+	var etaMin, etaMax *int
 	err := db.QueryRow(ctx, `
 		SELECT o.id::text, o.order_number, o.user_id::text, o.status::text, o.subtotal, o.delivery_fee, o.discount, o.total,
 		       o.payment_method, o.note, o.voucher_id::text, v.code, o.created_at,
 		       s.id, s.name, s.address, s.is_open, o.address_id::text,
-		       o.payment_account_id::text, o.payment_provider, o.payment_account_masked
+		       o.payment_account_id::text, o.payment_provider, o.payment_account_masked,
+		       o.distance_km::float8, o.eta_min_minutes, o.eta_max_minutes, o.free_delivery_coupon, o.delivery_fee_waived
 		FROM orders o
 		JOIN stores s ON s.id = o.store_id
 		LEFT JOIN vouchers v ON v.id = o.voucher_id
@@ -353,9 +454,25 @@ func (Repository) Get(ctx context.Context, db database.DBTX, id, userID string) 
 		Scan(&o.ID, &o.OrderNumber, &o.UserID, &o.Status, &o.Subtotal, &o.DeliveryFee, &o.Discount, &o.Total,
 			&o.PaymentMethod, &o.Note, &o.VoucherID, &o.VoucherCode, &o.CreatedAt,
 			&o.Store.ID, &o.Store.Name, &o.Store.Address, &o.Store.IsOpen, &addrID,
-			&o.PaymentAccountID, &o.PaymentProvider, &o.PaymentAccountMasked)
+			&o.PaymentAccountID, &o.PaymentProvider, &o.PaymentAccountMasked,
+			&o.DistanceKM, &etaMin, &etaMax, &o.FreeDeliveryCoupon, &o.DeliveryFeeWaived)
 	if err != nil {
 		return o, err
+	}
+	if etaMin != nil && etaMax != nil {
+		o.ETA = &ETA{MinMinutes: *etaMin, MaxMinutes: *etaMax}
+	}
+
+	// Bayar Online: uang sudah masuk, jadi pelanggan perlu tahu status pengembalian dananya.
+	var refunded *int64
+	err = db.QueryRow(ctx, `
+		SELECT COALESCE((SELECT sum(r.amount) FROM payment_refunds r WHERE r.payment_id = p.id AND r.status = 'SUCCEEDED'), 0)
+		FROM payments p WHERE p.order_id = $1`, o.ID).Scan(&refunded)
+	if err != nil && !database.IsNoRows(err) {
+		return o, err
+	}
+	if refunded != nil {
+		o.Refund = refundInfo(o.Status, o.Total, *refunded)
 	}
 
 	if addrID != nil {
@@ -371,14 +488,18 @@ func (Repository) Get(ctx context.Context, db database.DBTX, id, userID string) 
 	}
 
 	rows, err := db.Query(ctx, `
-		SELECT product_id, product_name, option_id, option_name, unit_price, quantity, note, subtotal
+		SELECT product_id, product_name, option_id, option_name, unit_price, quantity, note, subtotal, bundle_items
 		FROM order_items WHERE order_id = $1 ORDER BY sort_order`, o.ID)
 	if err != nil {
 		return o, err
 	}
 	o.Items, err = pgx.CollectRows(rows, func(row pgx.CollectableRow) (Line, error) {
 		var l Line
-		err := row.Scan(&l.ProductID, &l.ProductName, &l.OptionID, &l.OptionName, &l.UnitPrice, &l.Quantity, &l.Note, &l.Subtotal)
+		var bundle []byte
+		err := row.Scan(&l.ProductID, &l.ProductName, &l.OptionID, &l.OptionName, &l.UnitPrice, &l.Quantity, &l.Note, &l.Subtotal, &bundle)
+		if err == nil && bundle != nil {
+			err = json.Unmarshal(bundle, &l.Bundle)
+		}
 		return l, err
 	})
 	if err != nil {

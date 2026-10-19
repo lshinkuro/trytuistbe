@@ -25,6 +25,8 @@ type quoteRequest struct {
 	AddressID   string        `json:"address_id" validate:"max=64"`
 	VoucherCode string        `json:"voucher_code" validate:"max=50"`
 	Items       []itemRequest `json:"items" validate:"max=50,dive"`
+	// true = pakai kupon gratis ongkir mingguan untuk pesanan ini.
+	UseFreeDelivery bool `json:"use_free_delivery"`
 }
 
 type createRequest struct {
@@ -53,7 +55,8 @@ func (r quoteRequest) toInput() QuoteInput {
 		}
 		items[i] = ItemInput{ProductID: it.ProductID, OptionID: opt, Quantity: it.Quantity, Note: it.Note}
 	}
-	return QuoteInput{StoreID: r.StoreID, AddressID: r.AddressID, VoucherCode: r.VoucherCode, Items: items}
+	return QuoteInput{StoreID: r.StoreID, AddressID: r.AddressID, VoucherCode: r.VoucherCode, Items: items,
+		UseFreeDelivery: r.UseFreeDelivery}
 }
 
 // ===== Response DTO =====
@@ -67,6 +70,8 @@ type LineDTO struct {
 	Quantity    int     `json:"quantity"`
 	Note        string  `json:"note"`
 	Subtotal    int64   `json:"subtotal"`
+	// Isi combo per 1 paket; tidak dikirim untuk produk biasa.
+	BundleItems []BundleLine `json:"bundle_items,omitempty"`
 }
 
 type QuoteDTO struct {
@@ -78,6 +83,22 @@ type QuoteDTO struct {
 	Discount    int64     `json:"discount"`
 	Total       int64     `json:"total"`
 	VoucherCode *string   `json:"voucher_code"`
+	// null bila alamat tidak punya koordinat.
+	DistanceKM    *float64 `json:"distance_km"`
+	ETAMinMinutes *int     `json:"eta_min_minutes"`
+	ETAMaxMinutes *int     `json:"eta_max_minutes"`
+	// Kupon gratis ongkir mingguan; null bila tidak dihitung (snapshot lama).
+	FreeDelivery *FreeDeliveryDTO `json:"free_delivery"`
+}
+
+type FreeDeliveryDTO struct {
+	Enabled     bool   `json:"enabled"`
+	WeeklyQuota int    `json:"weekly_quota"`
+	Used        int    `json:"used"`
+	Remaining   int    `json:"remaining"`
+	ResetsAt    string `json:"resets_at"`
+	Applied     bool   `json:"applied"`    // kupon dipakai di quote ini
+	FeeWaived   int64  `json:"fee_waived"` // ongkir yang digratiskan
 }
 
 // OrderSummaryDTO = OrderDTO di iOS (tab Pesanan).
@@ -147,6 +168,18 @@ type OrderDTO struct {
 	Rating               *RatingDTO       `json:"rating"`
 	CanCancel            bool             `json:"can_cancel"`
 	CanRate              bool             `json:"can_rate"`
+	DistanceKM           *float64         `json:"distance_km"`
+	ETAMinMinutes        *int             `json:"eta_min_minutes"`
+	ETAMaxMinutes        *int             `json:"eta_max_minutes"`
+	FreeDeliveryCoupon   bool             `json:"free_delivery_coupon"`
+	DeliveryFeeWaived    int64            `json:"delivery_fee_waived"`
+	// Pengembalian dana pesanan Bayar Online; null bila tidak ada.
+	Refund *RefundDTO `json:"refund"`
+}
+
+type RefundDTO struct {
+	Status string `json:"status"` // PENDING | PARTIAL | COMPLETED
+	Amount int64  `json:"amount"`
 }
 
 func toLineDTOs(lines []Line) []LineDTO {
@@ -154,7 +187,7 @@ func toLineDTOs(lines []Line) []LineDTO {
 	for i, l := range lines {
 		out[i] = LineDTO{
 			ProductID: l.ProductID, ProductName: l.ProductName, OptionID: l.OptionID, OptionName: l.OptionName,
-			UnitPrice: l.UnitPrice, Quantity: l.Quantity, Note: l.Note, Subtotal: l.Subtotal,
+			UnitPrice: l.UnitPrice, Quantity: l.Quantity, Note: l.Note, Subtotal: l.Subtotal, BundleItems: l.Bundle,
 		}
 	}
 	return out
@@ -164,6 +197,18 @@ func toQuoteDTO(q Quote) QuoteDTO {
 	dto := QuoteDTO{
 		StoreID: q.StoreID, StoreName: q.StoreName, Items: toLineDTOs(q.Lines),
 		Subtotal: q.Subtotal, DeliveryFee: q.DeliveryFee, Discount: q.Discount, Total: q.Total,
+		DistanceKM: q.DistanceKM,
+	}
+	if q.ETA != nil {
+		dto.ETAMinMinutes, dto.ETAMaxMinutes = &q.ETA.MinMinutes, &q.ETA.MaxMinutes
+	}
+	if f := q.FreeDelivery; f != nil {
+		dto.FreeDelivery = &FreeDeliveryDTO{Enabled: f.Enabled, WeeklyQuota: f.WeeklyQuota, Used: f.Used,
+			Remaining: f.Remaining(), ResetsAt: httpx.ISO(f.ResetsAt), Applied: q.FreeDeliveryCoupon, FeeWaived: q.DeliveryFeeWaived}
+		if q.FreeDeliveryCoupon {
+			// Kupon yang dipakai quote ini belum tercatat → tampilkan sisa setelah checkout.
+			dto.FreeDelivery.Remaining = max(dto.FreeDelivery.Remaining-1, 0)
+		}
 	}
 	if q.Voucher != nil {
 		dto.VoucherCode = &q.Voucher.Code
@@ -188,11 +233,18 @@ func ToOrderDTO(o Order) OrderDTO {
 		Subtotal: o.Subtotal, DeliveryFee: o.DeliveryFee, Discount: o.Discount, Total: o.Total,
 		PaymentMethod: o.PaymentMethod, Note: o.Note, VoucherCode: o.VoucherCode,
 		PaymentProvider: o.PaymentProvider, PaymentAccountMasked: o.PaymentAccountMasked,
-		CreatedAt: httpx.ISO(o.CreatedAt),
-		Items:     toLineDTOs(o.Items),
-		Store:     StoreDTO{ID: o.Store.ID, Name: o.Store.Name, Address: o.Store.Address},
-		CanCancel: o.Status == StatusPending,
-		CanRate:   o.Status == StatusCompleted && o.Rating == nil,
+		CreatedAt:  httpx.ISO(o.CreatedAt),
+		Items:      toLineDTOs(o.Items),
+		Store:      StoreDTO{ID: o.Store.ID, Name: o.Store.Name, Address: o.Store.Address},
+		CanCancel:  o.Status == StatusPending,
+		CanRate:    o.Status == StatusCompleted && o.Rating == nil,
+		DistanceKM: o.DistanceKM, FreeDeliveryCoupon: o.FreeDeliveryCoupon, DeliveryFeeWaived: o.DeliveryFeeWaived,
+	}
+	if o.ETA != nil {
+		dto.ETAMinMinutes, dto.ETAMaxMinutes = &o.ETA.MinMinutes, &o.ETA.MaxMinutes
+	}
+	if r := o.Refund; r != nil {
+		dto.Refund = &RefundDTO{Status: r.Status, Amount: r.Amount}
 	}
 	switch {
 	case o.PaymentAccountID != nil:

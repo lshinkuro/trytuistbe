@@ -183,8 +183,18 @@ func (s *Service) DeleteAddress(ctx context.Context, userID, id string) error {
 	})
 }
 
-func (s *Service) Favorites(ctx context.Context, userID string) ([]catalog.Product, error) {
-	return catalog.NewRepository(s.pool).FavoriteProducts(ctx, userID)
+// Favorites: harga & stok mengikuti storeID (opsional, §5.29).
+func (s *Service) Favorites(ctx context.Context, userID, storeID string) ([]catalog.Product, error) {
+	cat := catalog.NewRepository(s.pool)
+	store, err := cat.StoreFromQuery(ctx, storeID)
+	if err != nil {
+		return nil, err
+	}
+	id := ""
+	if store != nil {
+		id = store.ID
+	}
+	return cat.FavoriteProducts(ctx, userID, id)
 }
 
 func (s *Service) AddFavorite(ctx context.Context, userID, productID string) error {

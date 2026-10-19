@@ -193,7 +193,7 @@ func (h *Handler) DeleteAddress(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/me/favorites 🔒
 func (h *Handler) Favorites(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.Favorites(r.Context(), httpx.UserID(r.Context()))
+	list, err := h.svc.Favorites(r.Context(), httpx.UserID(r.Context()), r.URL.Query().Get("store_id"))
 	if err != nil {
 		httpx.FromError(w, r, err)
 		return

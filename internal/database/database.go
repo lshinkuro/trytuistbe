@@ -75,6 +75,12 @@ func IsUniqueViolation(err error, constraint ...string) bool {
 	return false
 }
 
+// IsCheckViolation: true bila err adalah pelanggaran CHECK (mis. stok jadi negatif).
+func IsCheckViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514"
+}
+
 // IsNoRows: true bila query tidak menemukan baris.
 func IsNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 

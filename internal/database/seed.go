@@ -14,6 +14,7 @@ import (
 type DemoUser struct {
 	Email, Password, Name, Phone, Tier string
 	Role                               string // "" = CUSTOMER
+	StoreID                            string // wajib untuk OUTLET_ADMIN
 	Points                             int
 	Balance                            int64
 	Vouchers                           []string
@@ -27,8 +28,10 @@ type DemoAddress struct {
 
 var DemoUsers = []DemoUser{
 	// Akun web admin (trytuistadmin). Hanya untuk dev/staging; di prod promosikan
-	// user lewat SQL: UPDATE users SET role = 'ADMIN' WHERE lower(email) = '...';
-	{Email: "admin@trytuist.com", Password: "admin12345", Name: "Admin TryTuist", Tier: "SILVER", Role: "ADMIN"},
+	// user lewat SQL: UPDATE users SET role = 'SUPER_ADMIN' WHERE lower(email) = '...';
+	{Email: "admin@trytuist.com", Password: "admin12345", Name: "Admin TryTuist", Tier: "SILVER", Role: "SUPER_ADMIN"},
+	// Admin outlet Kemang Utara: hanya pesanan, menu, stok, harga, dan promo outlet ST02.
+	{Email: "kemang@trytuist.com", Password: "outlet12345", Name: "Admin Kemang", Tier: "SILVER", Role: "OUTLET_ADMIN", StoreID: "ST02"},
 	{
 		Email: "kholis@gmail.com", Password: "12345678", Name: "Kholis", Phone: "081234567890",
 		Tier: "GOLD", Points: 1250, Balance: 50000,
@@ -82,10 +85,11 @@ func seedUser(ctx context.Context, tx pgx.Tx, u DemoUser, cost int) error {
 	}
 	var id string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance, role)
-		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8)
-		ON CONFLICT (lower(email)) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role, updated_at = now()
-		RETURNING id::text`, u.Name, u.Email, string(hash), u.Phone, u.Tier, u.Points, u.Balance, role).Scan(&id)
+		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance, role, store_id)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, NULLIF($9, ''))
+		ON CONFLICT (lower(email)) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role,
+		    store_id = EXCLUDED.store_id, updated_at = now()
+		RETURNING id::text`, u.Name, u.Email, string(hash), u.Phone, u.Tier, u.Points, u.Balance, role, u.StoreID).Scan(&id)
 	if err != nil {
 		return err
 	}

@@ -180,3 +180,22 @@ func (h *Handler) Finish(w http.ResponseWriter, r *http.Request) {
 <h2>Terima kasih!</h2><p>Kembali ke aplikasi TryTuist untuk melihat status pembayaran.</p>
 <p style="color:#888;font-size:13px">`+orderID+`</p></body></html>`)
 }
+
+// POST /v1/dev/payments/{id}/simulate { status: settlement|deny|expire|cancel, payment_type } — hanya dev.
+func (h *Handler) DevSimulate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Status      string `json:"status" validate:"required"`
+		PaymentType string `json:"payment_type" validate:"max=30"`
+	}
+	if err := httpx.Decode(r, &req); err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	p, err := h.svc.DevSimulate(r.Context(), httpx.UserID(r.Context()), chi.URLParam(r, "id"),
+		strings.ToLower(strings.TrimSpace(req.Status)), strings.TrimSpace(req.PaymentType))
+	if err != nil {
+		httpx.FromError(w, r, err)
+		return
+	}
+	httpx.JSONMessage(w, http.StatusOK, "Simulasi diterapkan", h.svc.toDTO(p))
+}

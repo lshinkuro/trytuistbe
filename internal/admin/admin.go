@@ -2,7 +2,10 @@
 //
 // Login memakai POST /v1/auth/login yang sama dengan aplikasi. Semua route
 // /v1/admin/* memakai Auth + RequireAdmin: role dicek ke DB setiap request,
-// jadi mencabut role ADMIN langsung berlaku tanpa menunggu token habis.
+// jadi mencabut role admin langsung berlaku tanpa menunggu token habis.
+//
+// Dua role (§5.29): SUPER_ADMIN melihat & mengatur semua outlet; OUTLET_ADMIN terikat ke
+// satu outlet (users.store_id) dan semua data yang dibaca/diubah dipaksa ke outlet itu.
 package admin
 
 import (
@@ -10,24 +13,35 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"trytuist-api/internal/appconfig"
 	"trytuist-api/internal/catalog"
 	"trytuist-api/internal/database"
 	"trytuist-api/internal/httpx"
 	"trytuist-api/internal/order"
+	"trytuist-api/internal/payment"
 )
 
-const RoleAdmin = "ADMIN"
+const (
+	RoleSuperAdmin  = "SUPER_ADMIN"
+	RoleOutletAdmin = "OUTLET_ADMIN"
+)
 
 type Admin struct {
-	ID    string
-	Name  string
-	Email string
+	ID        string
+	Name      string
+	Email     string
+	Role      string
+	StoreID   string // hanya OUTLET_ADMIN
+	StoreName string
 }
+
+func (a Admin) IsSuper() bool { return a.Role == RoleSuperAdmin }
 
 type ctxKey struct{}
 
@@ -36,7 +50,44 @@ func adminFrom(ctx context.Context) Admin {
 	return a
 }
 
-var errNotAdmin = httpx.NewError(http.StatusForbidden, "FORBIDDEN", "Akun ini tidak punya akses admin.")
+var (
+	errNotAdmin   = httpx.NewError(http.StatusForbidden, "FORBIDDEN", "Akun ini tidak punya akses admin.")
+	errNotSuper   = httpx.NewError(http.StatusForbidden, "FORBIDDEN", "Hanya super admin yang bisa melakukan ini.")
+	errOtherStore = httpx.NewError(http.StatusForbidden, "FORBIDDEN", "Kamu hanya bisa mengatur outletmu sendiri.")
+)
+
+// scopeStore: outlet yang dipakai sebuah request. Admin outlet selalu outletnya sendiri
+// (meminta outlet lain → 403); super admin memakai requested (” = semua outlet).
+func scopeStore(ctx context.Context, requested string) (string, error) {
+	a := adminFrom(ctx)
+	requested = strings.TrimSpace(requested)
+	if a.IsSuper() {
+		return requested, nil
+	}
+	if requested != "" && requested != a.StoreID {
+		return "", errOtherStore
+	}
+	return a.StoreID, nil
+}
+
+// canManageStore: super admin, atau admin outlet untuk outletnya sendiri.
+func canManageStore(ctx context.Context, storeID string) error {
+	if a := adminFrom(ctx); !a.IsSuper() && a.StoreID != storeID {
+		return errOtherStore
+	}
+	return nil
+}
+
+// RequireSuperAdmin dipasang setelah RequireAdmin untuk route khusus pusat.
+func RequireSuperAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !adminFrom(r.Context()).IsSuper() {
+			httpx.FromError(w, r, errNotSuper)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // RequireAdmin dipasang setelah httpx.Auth.
 func RequireAdmin(pool *pgxpool.Pool) func(http.Handler) http.Handler {
@@ -44,10 +95,11 @@ func RequireAdmin(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			var a Admin
-			var role string
-			err := pool.QueryRow(ctx, `SELECT id::text, name, email, role FROM users WHERE id = $1`, httpx.UserID(ctx)).
-				Scan(&a.ID, &a.Name, &a.Email, &role)
-			if database.IsNoRows(err) || (err == nil && role != RoleAdmin) {
+			err := pool.QueryRow(ctx, `
+				SELECT u.id::text, u.name, u.email, u.role, COALESCE(u.store_id, ''), COALESCE(s.name, '')
+				FROM users u LEFT JOIN stores s ON s.id = u.store_id WHERE u.id = $1`, httpx.UserID(ctx)).
+				Scan(&a.ID, &a.Name, &a.Email, &a.Role, &a.StoreID, &a.StoreName)
+			if database.IsNoRows(err) || (err == nil && a.Role != RoleSuperAdmin && a.Role != RoleOutletAdmin) {
 				httpx.FromError(w, r, errNotAdmin)
 				return
 			}
@@ -61,24 +113,40 @@ func RequireAdmin(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 }
 
 type Handler struct {
-	pool    *pgxpool.Pool
-	orders  *order.Service
-	catalog *catalog.Repository
-	loc     *time.Location
-	now     func() time.Time
+	pool      *pgxpool.Pool
+	orders    *order.Service
+	payments  *payment.Service
+	appConfig *appconfig.Repository
+	catalog   *catalog.Repository
+	loc       *time.Location
+	now       func() time.Time
 }
 
-func NewHandler(pool *pgxpool.Pool, orders *order.Service, loc *time.Location) *Handler {
+func NewHandler(pool *pgxpool.Pool, orders *order.Service, payments *payment.Service, appConfig *appconfig.Repository, loc *time.Location) *Handler {
 	if loc == nil {
 		loc = httpx.Loc
 	}
-	return &Handler{pool: pool, orders: orders, catalog: catalog.NewRepository(pool), loc: loc, now: time.Now}
+	return &Handler{pool: pool, orders: orders, payments: payments, appConfig: appConfig,
+		catalog: catalog.NewRepository(pool), loc: loc, now: time.Now}
 }
 
-// GET /v1/admin/me — dipakai web admin setelah login untuk memastikan akun ini admin.
+type MeDTO struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Email     string  `json:"email"`
+	Role      string  `json:"role"`
+	StoreID   *string `json:"store_id"` // null untuk super admin
+	StoreName *string `json:"store_name"`
+}
+
+// GET /v1/admin/me — dipakai web admin setelah login untuk memastikan akun ini admin & membaca role-nya.
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	a := adminFrom(r.Context())
-	httpx.JSON(w, http.StatusOK, map[string]string{"id": a.ID, "name": a.Name, "email": a.Email, "role": RoleAdmin})
+	me := MeDTO{ID: a.ID, Name: a.Name, Email: a.Email, Role: a.Role}
+	if a.StoreID != "" {
+		me.StoreID, me.StoreName = &a.StoreID, &a.StoreName
+	}
+	httpx.JSON(w, http.StatusOK, me)
 }
 
 // ===== Audit log =====
