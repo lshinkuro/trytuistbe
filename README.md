@@ -78,6 +78,7 @@ Pola per modul sama seperti iOS: **handler** (HTTP) → **service** (aturan bisn
 - IP klien: `X-Forwarded-For` hanya dipercaya dari proxy di jaringan internal (loopback/private, mis. Caddy), dan yang dipakai entri terakhir. Request langsung dari internet memakai IP koneksi.
 - `POST /v1/orders` & `/v1/checkout` wajib `Idempotency-Key`: klik ganda / retry tidak membuat pesanan atau sesi bayar ganda.
 - Limiter disimpan di memori (cukup untuk satu instance API).
+- Email: kode 6 digit (verifikasi & reset password) disimpan sebagai hash, berlaku 15 menit, 5× salah → hangus, kirim ulang min. 60 detik. Dikirim lewat Resend (`RESEND_API_KEY`); kosong = ditulis ke log server. Akun belum verifikasi email → `403 EMAIL_NOT_VERIFIED` saat checkout (`REQUIRE_VERIFIED_EMAIL`).
 
 **Swagger UI:** buka [http://localhost:8080/docs](http://localhost:8080/docs) setelah `make run` (juga di staging; dimatikan di prod). Spec-nya `docs/openapi.yaml` (OpenAPI 3), bisa diimpor ke Postman / Insomnia. Klik **Authorize** → isi `X-API-Key`, panggil `POST /v1/auth/login`, lalu tempel `access_token` ke `bearerAuth`.
 Menambah atau mengubah endpoint wajib memperbarui `docs/openapi.yaml`: `TestOpenAPICoversRoutes` gagal bila ada route yang belum tertulis (atau path di spec yang sudah tidak ada).
@@ -89,6 +90,8 @@ Semua di bawah `/v1` butuh header `X-API-Key`. 🔒 = butuh `Authorization: Bear
 | GET | `/healthz` | tanpa API key |
 | POST | `/v1/auth/register` · `/login` · `/refresh` | login: 5/menit/IP+email · daftar & refresh: `AUTH_RATE_LIMIT`/menit/IP |
 | POST | `/v1/auth/logout` | 🔒 |
+| POST | `/v1/auth/password/forgot` · `/v1/auth/password/reset` | lupa password: kode 6 digit ke email (selalu 200) → kode + password baru → sesi baru, sesi lama dicabut |
+| POST | `/v1/me/password` · `/v1/me/email/verification` · `/v1/me/email/verify` | 🔒 ganti password (perangkat lain keluar) · kirim ulang & verifikasi kode email |
 | POST | `/v1/auth/google` | daftar/masuk dengan Google (`id_token`). 201 = akun baru, 200 = akun lama. Butuh `GOOGLE_CLIENT_IDS` |
 | GET | `/v1/banners` · `/categories` · `/products` · `/products/{id}` · `/stores?lat=&lng=` | produk: `?store_id=` → stok outlet itu · stores: buka → menjangkau → terdekat |
 | POST | `/v1/orders/quote` · `/v1/orders` | 🔒 `/v1/orders`: header `Idempotency-Key` **wajib**, `CHECKOUT_RATE_LIMIT`/menit/user |

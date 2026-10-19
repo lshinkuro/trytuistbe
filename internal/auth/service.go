@@ -14,6 +14,7 @@ import (
 
 	"trytuist-api/internal/database"
 	"trytuist-api/internal/httpx"
+	"trytuist-api/internal/mail"
 	"trytuist-api/internal/token"
 )
 
@@ -44,6 +45,7 @@ type Service struct {
 	repo   Repository
 	tokens *token.Manager
 	google *GoogleVerifier
+	mailer mail.Sender
 }
 
 type Option func(*Service)
@@ -53,8 +55,13 @@ func WithGoogle(v *GoogleVerifier) Option {
 	return func(s *Service) { s.google = v }
 }
 
+// WithMailer: pengirim email kode (default: ditulis ke log).
+func WithMailer(m mail.Sender) Option {
+	return func(s *Service) { s.mailer = m }
+}
+
 func NewService(pool *pgxpool.Pool, tokens *token.Manager, opts ...Option) *Service {
-	s := &Service{pool: pool, tokens: tokens}
+	s := &Service{pool: pool, tokens: tokens, mailer: mail.LogSender{}}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -92,6 +99,12 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Session, erro
 		sess.IsNewUser = true
 		return err
 	})
+	if err == nil {
+		// Kode verifikasi langsung dikirim; gagal kirim tidak menggagalkan daftar (bisa minta ulang).
+		if serr := s.sendCode(ctx, sess.User, PurposeVerifyEmail); serr != nil {
+			slog.WarnContext(ctx, "kirim kode verifikasi gagal", "user_id", sess.User.ID, "err", serr)
+		}
+	}
 	return sess, err
 }
 

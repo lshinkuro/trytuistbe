@@ -138,6 +138,44 @@ paths:
         "200": { $ref: "#/components/responses/Session" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
+  /v1/auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Lupa password — kirim kode 6 digit ke email
+      description: Selalu 200 (tidak membocorkan apakah email terdaftar). Kode berlaku 15 menit; kirim ulang paling cepat 60 detik.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /v1/auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Reset password dengan kode → langsung masuk
+      description: "Semua sesi lama dicabut; email dianggap terverifikasi. 5 kode salah → `CODE_LOCKED` (minta kode baru)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code, new_password]
+              properties:
+                email: { type: string, format: email }
+                code: { type: string, pattern: "^[0-9]{6}$", example: "482913" }
+                new_password: { type: string, minLength: 8, maxLength: 72 }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/CodeRejected" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
   /v1/auth/logout:
     post:
       tags: [Auth]
@@ -520,6 +558,7 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Checkout" }
         "201": { $ref: "#/components/responses/Checkout" }
+        "403": { $ref: "#/components/responses/EmailNotVerified" }
         "409": { $ref: "#/components/responses/Conflict" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "422": { $ref: "#/components/responses/QuoteRejected" }
@@ -619,6 +658,54 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Profile" }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/me/password:
+    post:
+      tags: [Profil]
+      summary: Ganti password 🔒
+      description: "`current_password` wajib kecuali akun Google tanpa password (`has_password: false` di /v1/me). Password saat ini salah → `400 VALIDATION_ERROR` (field `current_password`), bukan 401. Perangkat lain dikeluarkan; perangkat ini mendapat sesi baru."
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8, maxLength: 72 }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/me/email/verification:
+    post:
+      tags: [Profil]
+      summary: Kirim ulang kode verifikasi email 🔒
+      security: [{ apiKey: [], bearerAuth: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /v1/me/email/verify:
+    post:
+      tags: [Profil]
+      summary: Verifikasi email dengan kode 🔒
+      description: Kode otomatis dikirim setelah daftar. Akun belum terverifikasi tidak bisa checkout (`403 EMAIL_NOT_VERIFIED`).
+      security: [{ apiKey: [], bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, pattern: "^[0-9]{6}$" }
+      responses:
+        "200": { $ref: "#/components/responses/Ok" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/CodeRejected" }
   /v1/me/addresses:
     get:
       tags: [Profil]
@@ -1608,6 +1695,12 @@ components:
                             delivery_fee: { type: integer, example: 14000 }
                             eta_min_minutes: { type: integer, example: 30 }
                             eta_max_minutes: { type: integer, example: 40 }
+    CodeRejected:
+      description: "`INVALID_CODE` (salah / kedaluwarsa / sudah dipakai) atau `CODE_LOCKED` (5× salah, minta kode baru)"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    EmailNotVerified:
+      description: "`EMAIL_NOT_VERIFIED` — verifikasi email dulu (POST /v1/me/email/verify)"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     BadRequest:
       description: "`VALIDATION_ERROR` — detail per field di `error.details`"
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -1677,6 +1770,7 @@ components:
         refresh_token: { type: string }
         expires_at: { type: integer, description: Unix detik }
         is_new_user: { type: boolean }
+        email_verified: { type: boolean, description: "false → minta kode verifikasi (dibutuhkan untuk memesan)" }
     BannerAction:
       type: object
       description: "Aksi saat banner di-tap. PRODUCT/CATEGORY: value = id produk/kategori. FREE_DELIVERY: info kupon gratis ongkir mingguan."
@@ -2108,6 +2202,8 @@ components:
         points: { type: integer }
         voucher_count: { type: integer }
         balance: { type: integer }
+        email_verified: { type: boolean }
+        has_password: { type: boolean, description: false = akun Google tanpa password }
     AddressInput:
       type: object
       properties:

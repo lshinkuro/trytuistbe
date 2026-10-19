@@ -85,8 +85,8 @@ func seedUser(ctx context.Context, tx pgx.Tx, u DemoUser, cost int) error {
 	}
 	var id string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance, role, store_id)
-		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, NULLIF($9, ''))
+		INSERT INTO users (name, email, password_hash, phone, member_tier, points, balance, role, store_id, email_verified_at)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, NULLIF($9, ''), now())
 		ON CONFLICT (lower(email)) DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role,
 		    store_id = EXCLUDED.store_id, updated_at = now()
 		RETURNING id::text`, u.Name, u.Email, string(hash), u.Phone, u.Tier, u.Points, u.Balance, role, u.StoreID).Scan(&id)

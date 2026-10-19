@@ -290,6 +290,14 @@ USE_MOCK_DATA = NO
 - Restart API supaya `.env.prod` baru terbaca:
   `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d api`
 
+**Email (Resend)** — kode verifikasi & reset password:
+
+1. Daftar di [resend.com](https://resend.com) → **Domains → Add domain** (mis. `trytuist.id`), tambahkan record DNS (SPF, DKIM) yang diberikan di pengelola DNS, tunggu status *Verified*.
+2. **API Keys → Create** (izin *Sending access*).
+3. `.env.prod`: `RESEND_API_KEY=re_…`, `EMAIL_FROM=TryTuist <noreply@trytuist.id>`, lalu `dc up -d api`.
+
+Tanpa domain terverifikasi, Resend hanya bisa mengirim ke email pemilik akun Resend (alamat `onboarding@resend.dev`).
+
 **Swagger UI** (`/docs`) **sengaja mati di prod**. Pakai server staging atau lokal untuk membaca dokumentasi.
 
 ## 10. Backup & restore

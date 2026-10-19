@@ -24,6 +24,7 @@ import (
 	"trytuist-api/internal/content"
 	"trytuist-api/internal/home"
 	"trytuist-api/internal/httpx"
+	"trytuist-api/internal/mail"
 	"trytuist-api/internal/order"
 	"trytuist-api/internal/payment"
 	"trytuist-api/internal/promo"
@@ -41,6 +42,12 @@ type Option func(*options)
 type options struct {
 	gateway    payment.Gateway
 	pushSender push.Sender
+	mailer     mail.Sender
+}
+
+// WithMailSender: pakai pengirim email ini (mis. fake di tes yang menyimpan kode).
+func WithMailSender(m mail.Sender) Option {
+	return func(o *options) { o.mailer = m }
 }
 
 // WithPushSender: pakai sender ini (mis. fake APNs di tes).
@@ -88,7 +95,13 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 	tokens := token.NewManager(cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 
 	google := auth.NewGoogleVerifier(cfg.GoogleClientIDs, cfg.GoogleJWKSURL)
-	authH := auth.NewHandler(auth.NewService(pool, tokens, auth.WithGoogle(google)),
+	if o.mailer == nil {
+		o.mailer = mail.LogSender{}
+		if cfg.ResendAPIKey != "" {
+			o.mailer = mail.NewResend(cfg.ResendAPIKey, cfg.EmailFrom)
+		}
+	}
+	authH := auth.NewHandler(auth.NewService(pool, tokens, auth.WithGoogle(google), auth.WithMailer(o.mailer)),
 		httpx.NewRateLimiter(cfg.LoginRateLimit, time.Minute))
 	catalogH := catalog.NewHandler(catalog.NewRepository(pool))
 	// order_rules di tabel app_config; nilai env hanya cadangan bila key belum ada.
@@ -139,6 +152,10 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 	writeLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.WriteRateLimit, time.Minute), httpx.ByUserWrites)
 	checkoutLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.CheckoutRateLimit, time.Minute), httpx.ByUser)
 	authLimit := httpx.RateLimit(httpx.NewRateLimiter(cfg.AuthRateLimit, time.Minute), httpx.ClientIP)
+	verified := func(next http.Handler) http.Handler { return next }
+	if cfg.RequireVerifiedEmail {
+		verified = auth.RequireVerifiedEmail(pool)
+	}
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(httpx.APIKey(cfg.APIKeys))
@@ -146,6 +163,8 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 		r.Post("/auth/login", authH.Login) // rate limit di handler (per IP + email)
 		r.With(authLimit).Post("/auth/register", authH.Register)
 		r.With(authLimit).Post("/auth/refresh", authH.Refresh)
+		r.With(authLimit).Post("/auth/password/forgot", authH.ForgotPassword)
+		r.With(authLimit).Post("/auth/password/reset", authH.ResetPassword)
 		r.Post("/auth/google", authH.Google) // daftar & masuk dengan Google (rate limit per IP)
 
 		r.Get("/banners", catalogH.Banners)
@@ -172,18 +191,21 @@ func NewApp(cfg config.Config, pool *pgxpool.Pool, opts ...Option) *App {
 			r.Post("/auth/logout", authH.Logout)
 
 			r.Post("/orders/quote", orderH.Quote)
-			r.With(checkoutLimit).Post("/orders", orderH.Create)
+			r.With(checkoutLimit, verified).Post("/orders", orderH.Create)
 			r.Get("/orders", orderH.List)
 			r.Get("/orders/{id}", orderH.Get)
 			r.Post("/orders/{id}/cancel", orderH.Cancel)
 			r.Post("/orders/{id}/rating", orderH.Rate)
 
-			r.With(checkoutLimit).Post("/checkout", checkoutH.Checkout)
+			r.With(checkoutLimit, verified).Post("/checkout", checkoutH.Checkout)
 			r.Get("/payments", checkoutH.List)
 			r.Get("/payments/{id}", checkoutH.Get)
 			r.Post("/payments/{id}/cancel", checkoutH.Cancel)
 
 			r.Get("/me", userH.Me)
+			r.Post("/me/password", authH.ChangePassword)
+			r.With(authLimit).Post("/me/email/verification", authH.SendVerification)
+			r.With(authLimit).Post("/me/email/verify", authH.VerifyEmail)
 			r.Patch("/me", userH.UpdateMe)
 			r.Get("/me/addresses", userH.Addresses)
 			r.Post("/me/addresses", userH.CreateAddress)

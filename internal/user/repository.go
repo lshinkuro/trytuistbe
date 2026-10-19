@@ -20,6 +20,9 @@ type Profile struct {
 	Points       int
 	VoucherCount int
 	Balance      int64
+	// EmailVerified: dibutuhkan untuk memesan. HasPassword: false = akun Google tanpa password.
+	EmailVerified bool
+	HasPassword   bool
 }
 
 type Address struct {
@@ -52,9 +55,11 @@ func (Repository) Profile(ctx context.Context, db database.DBTX, userID string) 
 	err := db.QueryRow(ctx, `
 		SELECT u.id::text, u.name, u.email, u.phone, u.avatar_url, u.member_tier, u.points, u.balance,
 		       (SELECT count(*) FROM user_vouchers uv JOIN vouchers v ON v.id = uv.voucher_id
-		         WHERE uv.user_id = u.id AND uv.used_at IS NULL AND v.ends_at >= now())::int
+		         WHERE uv.user_id = u.id AND uv.used_at IS NULL AND v.ends_at >= now())::int,
+		       u.email_verified_at IS NOT NULL, u.password_hash IS NOT NULL
 		FROM users u WHERE u.id = $1`, userID).
-		Scan(&p.ID, &p.Name, &p.Email, &p.Phone, &p.AvatarURL, &p.MemberTier, &p.Points, &p.Balance, &p.VoucherCount)
+		Scan(&p.ID, &p.Name, &p.Email, &p.Phone, &p.AvatarURL, &p.MemberTier, &p.Points, &p.Balance, &p.VoucherCount,
+			&p.EmailVerified, &p.HasPassword)
 	return p, err
 }
 

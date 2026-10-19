@@ -44,6 +44,8 @@ type SessionDTO struct {
 	ExpiresAt    int64  `json:"expires_at"`
 	// true = akun baru dibuat (register / Google pertama kali) → iOS bisa menampilkan sambutan.
 	IsNewUser bool `json:"is_new_user"`
+	// false = minta user memasukkan kode verifikasi yang dikirim ke email (dibutuhkan untuk memesan).
+	EmailVerified bool `json:"email_verified"`
 }
 
 func toSessionDTO(s Session) SessionDTO {
@@ -52,12 +54,13 @@ func toSessionDTO(s Session) SessionDTO {
 		img = *s.User.AvatarURL
 	}
 	return SessionDTO{
-		UserName:     s.User.Name,
-		UserImage:    img,
-		AccessToken:  s.AccessToken,
-		RefreshToken: s.RefreshToken,
-		ExpiresAt:    s.ExpiresAt,
-		IsNewUser:    s.IsNewUser,
+		UserName:      s.User.Name,
+		UserImage:     img,
+		AccessToken:   s.AccessToken,
+		RefreshToken:  s.RefreshToken,
+		ExpiresAt:     s.ExpiresAt,
+		IsNewUser:     s.IsNewUser,
+		EmailVerified: s.User.EmailVerified,
 	}
 }
 

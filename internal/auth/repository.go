@@ -16,13 +16,15 @@ type User struct {
 	PasswordHash string
 	AvatarURL    *string
 	GoogleSub    *string
+	// EmailVerified: pemilik email sudah memasukkan kode verifikasi (akun Google otomatis).
+	EmailVerified bool
 }
 
-const userColumns = `id::text, name, email, COALESCE(password_hash, ''), avatar_url, google_sub`
+const userColumns = `id::text, name, email, COALESCE(password_hash, ''), avatar_url, google_sub, email_verified_at IS NOT NULL`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.AvatarURL, &u.GoogleSub)
+	err := row.Scan(&u.ID, &u.Name, &u.Email, &u.PasswordHash, &u.AvatarURL, &u.GoogleSub, &u.EmailVerified)
 	return u, err
 }
 
@@ -64,15 +66,16 @@ func (Repository) UserByGoogleSub(ctx context.Context, db database.DBTX, sub str
 // LinkGoogle menautkan akun Google; foto profil Google dipakai bila user belum punya foto.
 func (Repository) LinkGoogle(ctx context.Context, db database.DBTX, userID, sub string, picture *string) (User, error) {
 	return scanUser(db.QueryRow(ctx, `
-		UPDATE users SET google_sub = $2, avatar_url = COALESCE(avatar_url, $3), updated_at = now()
+		UPDATE users SET google_sub = $2, avatar_url = COALESCE(avatar_url, $3),
+		       email_verified_at = COALESCE(email_verified_at, now()), updated_at = now()
 		WHERE id = $1
 		RETURNING `+userColumns, userID, sub, picture))
 }
 
 func (Repository) CreateGoogleUser(ctx context.Context, db database.DBTX, name, email, sub string, picture, fcm *string) (User, error) {
 	return scanUser(db.QueryRow(ctx, `
-		INSERT INTO users (name, email, google_sub, avatar_url, fcm_token)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (name, email, google_sub, avatar_url, fcm_token, email_verified_at)
+		VALUES ($1, $2, $3, $4, $5, now())
 		RETURNING `+userColumns, name, email, sub, picture, fcm))
 }
 

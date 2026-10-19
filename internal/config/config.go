@@ -43,6 +43,11 @@ type Config struct {
 	APNsKeyID   string
 	APNsTeamID  string
 	APNsKeyFile string // path file AuthKey_XXXX.p8
+	// Email lewat Resend. Kosong = email (berisi kode) hanya ditulis ke log.
+	ResendAPIKey string
+	EmailFrom    string
+	// Akun yang belum verifikasi email tidak bisa memesan (REQUIRE_VERIFIED_EMAIL=false untuk mematikan).
+	RequireVerifiedEmail bool
 }
 
 func (c Config) IsDev() bool  { return c.Env == "dev" }
@@ -155,6 +160,13 @@ func Load() (Config, error) {
 		return cfg, fmt.Errorf("PAYMENT_EXPIRY harus durasi ≥ 1m (mis. 15m)")
 	}
 	cfg.CODDisabled = strings.EqualFold(get("COD_ENABLED", "true"), "false")
+
+	cfg.ResendAPIKey = get("RESEND_API_KEY", "")
+	cfg.EmailFrom = get("EMAIL_FROM", "TryTuist <onboarding@resend.dev>")
+	cfg.RequireVerifiedEmail = !strings.EqualFold(get("REQUIRE_VERIFIED_EMAIL", "true"), "false")
+	if cfg.ResendAPIKey == "" && cfg.IsProd() {
+		slog.Warn("RESEND_API_KEY kosong di prod: kode verifikasi & reset password tidak terkirim ke email")
+	}
 
 	cfg.APNsKeyID = get("APNS_KEY_ID", "")
 	cfg.APNsTeamID = get("APNS_TEAM_ID", "")

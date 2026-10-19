@@ -22,6 +22,10 @@ type ProfileDTO struct {
 	Points       int     `json:"points"`
 	VoucherCount int     `json:"voucher_count"`
 	Balance      int64   `json:"balance"`
+	// false → tampilkan "Verifikasi email" (kode di POST /v1/me/email/verify).
+	EmailVerified bool `json:"email_verified"`
+	// false = akun Google tanpa password; ganti password tidak butuh password lama.
+	HasPassword bool `json:"has_password"`
 }
 
 type updateMeRequest struct {
@@ -77,7 +81,8 @@ type VoucherDTO struct {
 
 func toProfileDTO(p Profile) ProfileDTO {
 	return ProfileDTO{ID: p.ID, Name: p.Name, Email: p.Email, Phone: p.Phone, AvatarURL: p.AvatarURL,
-		MemberTier: p.MemberTier, Points: p.Points, VoucherCount: p.VoucherCount, Balance: p.Balance}
+		MemberTier: p.MemberTier, Points: p.Points, VoucherCount: p.VoucherCount, Balance: p.Balance,
+		EmailVerified: p.EmailVerified, HasPassword: p.HasPassword}
 }
 
 func toAddressDTO(a Address) AddressDTO {
